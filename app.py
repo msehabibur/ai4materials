@@ -13,8 +13,8 @@ _os.environ.setdefault("TORCH_NUM_THREADS", "1")
 _os.environ.setdefault("DGL_LOAD_GRAPHBOLT", "0")
 
 # ---- stdlib & third-party imports ----
-import os, io, uuid, json, time, warnings, traceback
-from typing import Tuple
+import os, io, uuid, json, warnings, traceback
+from typing import Tuple, Optional
 
 import numpy as np
 import streamlit as st
@@ -233,10 +233,27 @@ def download_bytes(filename: str, data: bytes, label: str = "Download") -> None:
     st.download_button(label=label, data=data, file_name=filename)
 
 # ---------------------------
+# Optional imports: Atomate2 / Jobflow
+# ---------------------------
+def import_atomate2() -> tuple[Optional[object], Optional[object], Optional[object], Optional[object], Optional[object]]:
+    """
+    Returns (PhononMaker, ElasticMaker, ForceFieldRelaxMaker, run_locally, SETTINGS)
+    or (None,...) if not installed. We show a nice hint in UI if missing.
+    """
+    try:
+        from atomate2.forcefields.flows.phonons import PhononMaker
+        from atomate2.forcefields.flows.elastic import ElasticMaker
+        from atomate2.forcefields.jobs import ForceFieldRelaxMaker
+        from jobflow import run_locally, SETTINGS
+        return PhononMaker, ElasticMaker, ForceFieldRelaxMaker, run_locally, SETTINGS
+    except Exception as exc:
+        return None, None, None, None, None
+
+# ---------------------------
 # UI
 # ---------------------------
-st.set_page_config(page_title="M3GNet Suite — Relaxation • MD • Single-Point", layout="wide")
-st.title("🔬 M3GNet Suite — Relaxation • MD • Single-Point")
+st.set_page_config(page_title="M3GNet Suite — Relaxation • MD • Single-Point • Elastic • Phonons", layout="wide")
+st.title("🔬 M3GNet Suite")
 
 # Sidebar: Model selection
 with st.sidebar:
@@ -275,9 +292,7 @@ with col_up1:
             parse_error = f"{type(exc).__name__}: {exc}"
     elif text_paste.strip():
         try:
-            # light hint only; parser tries multiple formats anyway
-            hint = "cif"
-            pmg_obj = parse_uploaded_structure(f"pasted.{hint}", text_paste.encode("utf-8"))
+            pmg_obj = parse_uploaded_structure("pasted.cif", text_paste.encode("utf-8"))
         except Exception as exc:
             parse_error = f"{type(exc).__name__}: {exc}"
     else:
@@ -298,12 +313,12 @@ with col_up1:
         render_structure_viewer(pmg_obj, height=480)
 
 with col_up2:
-    st.subheader("About")
+    st.subheader("Quick Notes")
     st.markdown(
         """
-        - **Viewer fix**: Crystals export as **CIF** (not XYZ); molecules as **XYZ**.
-        - **Calculators**: use **M3GNetCalculator(potential=...)** per current MatGL.
-        - **Compute**: Relaxation (BFGS), MD (Langevin), Single-Point.
+        - **Viewer**: Crystals → CIF (with unit cell); molecules → XYZ.
+        - **Calculators**: current MatGL `Potential` + `M3GNetCalculator`.
+        - **Atomate2** tabs do lazy-import; if missing, you’ll see install hints.
         """
     )
     if _MATGL_IMPORT_ERROR:
@@ -311,8 +326,36 @@ with col_up2:
 
 st.divider()
 
-# Tabs for workflows
-tab_relax, tab_md, tab_sp = st.tabs(["🔧 Relaxation", "🌡️ MD (NVT, Langevin)", "⚡ Single-point"])
+# Tabs
+tab_about, tab_relax, tab_elastic, tab_phonon, tab_md = st.tabs(
+    ["ℹ️ About / Tool", "🔧 Energy Optimization", "🧱 Elastic & Mechanical", "🎼 Phonons (Atomate2)", "🌡️ MD (NVT)"]
+)
+
+# ---------------------------
+# About tab
+# ---------------------------
+with tab_about:
+    st.subheader("What’s inside")
+    st.markdown(
+        """
+        - **Energy Optimization**: BFGS geometry relaxation on the M3GNet PES.
+        - **Elastic & Mechanical** *(Atomate2)*: CHGNet/M3GNet forcefields for
+          elastic constants and common stability criteria (e.g., Born).
+        - **Phonons** *(Atomate2)*: phonon DOS / band structure, CSV export.
+        - **MD (NVT)**: Langevin thermostat; MSD plot + trajectory export.
+        """
+    )
+    st.markdown(
+        """
+        **Dependencies for Atomate2 tabs** (add to your `requirements.txt` if you
+        don’t have them yet):
+        ```
+        atomate2
+        jobflow
+        ```
+        Optional (for symmetry paths, robust IO): `spglib` (already common), `monty`.
+        """
+    )
 
 # ---------------------------
 # Relaxation Tab
@@ -362,6 +405,182 @@ with tab_relax:
             st.error("Relaxation failed. See details in the expandable traceback below.")
             with st.expander("Traceback"):
                 st.code("".join(traceback.format_exception(exc)))
+
+# ---------------------------
+# Elastic constants tab (Atomate2)
+# ---------------------------
+with tab_elastic:
+    st.subheader("Elastic Constants & Mechanical Stability (Atomate2 ForceFields)")
+    PhononMaker, ElasticMaker, ForceFieldRelaxMaker, run_locally, SETTINGS = import_atomate2()
+
+    if ElasticMaker is None:
+        st.error(
+            "Atomate2 / Jobflow not available. Add to requirements:\n"
+            "`atomate2` and `jobflow`"
+        )
+    else:
+        col_e1, col_e2, col_e3 = st.columns(3)
+        with col_e1:
+            ff_name = st.selectbox("Force Field", ["M3GNet", "CHGNet"], index=0)
+        with col_e2:
+            fmax_el = st.number_input("Relax fmax (eV/Å)", value=1e-4, min_value=1e-6, max_value=1e-2, step=1e-4, format="%.6f")
+        with col_e3:
+            run_elastic = st.button("Run Elastic Workflow", type="primary", disabled=(pmg_obj is None))
+
+        if run_elastic and pmg_obj is not None:
+            try:
+                elastic_flow = ElasticMaker(
+                    bulk_relax_maker=ForceFieldRelaxMaker(
+                        force_field_name=ff_name,
+                        relax_cell=True,
+                        relax_kwargs={"fmax": float(fmax_el)}
+                    ),
+                    elastic_relax_maker=ForceFieldRelaxMaker(
+                        force_field_name=ff_name,
+                        relax_cell=False,
+                        relax_kwargs={"fmax": float(fmax_el)}
+                    ),
+                ).make(structure=pmg_obj)
+
+                st.info("Launching elastic workflow locally (jobflow).")
+                responses = run_locally(elastic_flow, create_folders=True)
+
+                store = SETTINGS.JOB_STORE
+                store.connect()
+                result = store.query_one(
+                    {"name": "fit_elastic_tensor"},
+                    properties=[
+                        "output.elastic_tensor",
+                        "output.derived_properties",
+                    ],
+                    load=True,
+                    sort={"completed_at": -1}
+                )
+                if result is None:
+                    st.warning("No elastic tensor found in store yet.")
+                else:
+                    et = result["output"]["elastic_tensor"]
+                    dp = result["output"]["derived_properties"]
+                    st.success("Elastic tensor (IEEE) and derived properties")
+                    st.code(json.dumps(et.get("ieee_format", et), indent=2))
+                    st.code(json.dumps(dp, indent=2))
+
+            except Exception as exc:
+                st.error("Elastic workflow failed. See details below.")
+                with st.expander("Traceback"):
+                    st.code("".join(traceback.format_exception(exc)))
+
+# ---------------------------
+# Phonons tab (Atomate2)
+# ---------------------------
+with tab_phonon:
+    st.subheader("Phonons: DOS & Band Structure (Atomate2 ForceFields)")
+    PhononMaker, ElasticMaker, ForceFieldRelaxMaker, run_locally, SETTINGS = import_atomate2()
+
+    if PhononMaker is None:
+        st.error(
+            "Atomate2 / Jobflow not available. Add to requirements:\n"
+            "`atomate2` and `jobflow`"
+        )
+    else:
+        col_p1, col_p2, col_p3 = st.columns(3)
+        with col_p1:
+            min_length = st.number_input("Supercell min length (Å)", value=15.0, min_value=8.0, max_value=30.0, step=0.5)
+        with col_p2:
+            store_fc = st.checkbox("Store force constants", value=False)
+        with col_p3:
+            run_ph = st.button("Run Phonon Workflow", type="primary", disabled=(pmg_obj is None))
+
+        if run_ph and pmg_obj is not None:
+            try:
+                phonon_flow = PhononMaker(
+                    min_length=float(min_length),
+                    store_force_constants=bool(store_fc),
+                ).make(structure=pmg_obj)
+
+                st.info("Launching phonon workflow locally (jobflow).")
+                _ = run_locally(phonon_flow, create_folders=True)
+
+                # Query results
+                store = SETTINGS.JOB_STORE
+                store.connect()
+                result = store.query_one(
+                    {"name": "generate_frequencies_eigenvectors"},
+                    properties=[
+                        "output.phonon_dos",
+                        "output.phonon_bandstructure",
+                    ],
+                    load=True,
+                    sort={"completed_at": -1}
+                )
+
+                if result is None:
+                    st.warning("No phonon results found yet.")
+                else:
+                    # Build Phonon objects
+                    from pymatgen.phonon.bandstructure import PhononBandStructureSymmLine
+                    from pymatgen.phonon.dos import PhononDos
+                    from pymatgen.phonon.plotter import PhononBSPlotter, PhononDosPlotter
+
+                    ph_bs = PhononBandStructureSymmLine.from_dict(result['output']['phonon_bandstructure'])
+                    ph_dos = PhononDos.from_dict(result['output']['phonon_dos'])
+
+                    # Plot DOS
+                    dos_plot = PhononDosPlotter()
+                    dos_plot.add_dos(label='Phonon DOS', dos=ph_dos)
+                    ax_dos = dos_plot.get_plot()
+                    fig_dos = ax_dos.get_figure()
+                    buf_dos = io.BytesIO()
+                    fig_dos.savefig(buf_dos, dpi=300, bbox_inches="tight")
+                    plt.close(fig_dos)
+                    buf_dos.seek(0)
+                    st.image(buf_dos.read(), caption="Phonon DOS", use_container_width=True)
+
+                    # Plot Band Structure
+                    bs_plot = PhononBSPlotter(bs=ph_bs)
+                    ax_bs = bs_plot.get_plot()
+                    fig_bs = ax_bs.get_figure()
+                    buf_bs = io.BytesIO()
+                    fig_bs.savefig(buf_bs, dpi=300, bbox_inches="tight")
+                    plt.close(fig_bs)
+                    buf_bs.seek(0)
+                    st.image(buf_bs.read(), caption="Phonon Band Structure", use_container_width=True)
+
+                    # CSV exports
+                    # DOS
+                    import csv
+                    dos_csv = io.StringIO()
+                    frequencies = ph_dos.frequencies  # THz
+                    total_dos = ph_dos.densities
+                    writer = csv.writer(dos_csv)
+                    writer.writerow(["Frequency (THz)", "Total DOS"])
+                    for fval, dval in zip(frequencies, total_dos):
+                        writer.writerow([fval, dval])
+                    download_bytes("phonon_dos.csv", dos_csv.getvalue().encode("utf-8"), label="⬇️ Download Phonon DOS (CSV)")
+
+                    # Bands
+                    bands = ph_bs.bands  # shape (n_branches, n_points)
+                    distances = ph_bs.distance  # length n_points
+                    bands_T = bands.T           # (n_points, n_branches)
+                    bs_csv = io.StringIO()
+                    writer = csv.writer(bs_csv)
+                    header = ["Distance (1/Å)"] + [f"Branch {i+1} (THz)" for i in range(bands.shape[0])]
+                    writer.writerow(header)
+                    for i, d in enumerate(distances):
+                        row = [d] + list(bands_T[i])
+                        writer.writerow(row)
+                    writer.writerow([])
+                    writer.writerow(["High Symmetry Points"])
+                    for label, dist in ph_bs.labels_dict.items():
+                        writer.writerow([label, dist])
+                    download_bytes("phonon_bandstructure.csv", bs_csv.getvalue().encode("utf-8"), label="⬇️ Download Phonon Bands (CSV)")
+
+                    st.success("Phonon analyses complete and files exported.")
+
+            except Exception as exc:
+                st.error("Phonon workflow failed. See details below.")
+                with st.expander("Traceback"):
+                    st.code("".join(traceback.format_exception(exc)))
 
 # ---------------------------
 # MD Tab
@@ -419,32 +638,6 @@ with tab_md:
 
         except Exception as exc:
             st.error("MD failed. See details in the expandable traceback below.")
-            with st.expander("Traceback"):
-                st.code("".join(traceback.format_exception(exc)))
-
-# ---------------------------
-# Single-point Tab
-# ---------------------------
-with tab_sp:
-    st.subheader("Single-point Energy / Forces")
-    run_sp = st.button("Run Single-point", use_container_width=True, type="primary", disabled=(potential is None or pmg_obj is None))
-
-    if run_sp and potential is not None and pmg_obj is not None:
-        try:
-            atoms = atoms_from(pmg_obj)
-            atoms.calc = M3GNetCalculator(potential=potential)
-            e = atoms.get_potential_energy()
-            f = atoms.get_forces()
-            st.success(f"E = {e:.6f} eV | max|F| = {np.abs(f).max():.4f} eV/Å")
-
-            # Save forces as CSV
-            import pandas as pd
-            df = pd.DataFrame(f, columns=["Fx (eV/Å)", "Fy (eV/Å)", "Fz (eV/Å)"])
-            csv = df.to_csv(index=False).encode("utf-8")
-            download_bytes("single_point_forces.csv", csv, label="⬇️ Download forces (CSV)")
-
-        except Exception as exc:
-            st.error("Single-point failed. See details in the expandable traceback below.")
             with st.expander("Traceback"):
                 st.code("".join(traceback.format_exception(exc)))
 
