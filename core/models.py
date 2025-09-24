@@ -1,0 +1,1 @@
+AVAILABLE_MODELS = ["CHGNet", "M3GNet", "MACE"]
