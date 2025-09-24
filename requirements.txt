@@ -1,0 +1,14 @@
+# Web UIs
+streamlit>=1.36
+dash>=2.16
+crystal-toolkit>=2024.3.1
+
+# Materials/ML
+pymatgen>=2024.6.0
+matgl>=0.9.6
+ase>=3.23.0    # IMPORTANT: >= 3.23 to provide IsotropicMTKNPT/NHC used by matgl.ext.ase
+
+# Utils / plotting
+tqdm>=4.66
+numpy>=1.24
+matplotlib>=3.8
