@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, traceback
+import json, gc, traceback
 import streamlit as st
 
 def _lazy_import():
@@ -55,6 +55,7 @@ def elastic_tab(pmg_obj):
             load=True,
             sort={"completed_at": -1},
         )
+
         if not result:
             st.warning("No results found yet.")
             return
@@ -64,6 +65,10 @@ def elastic_tab(pmg_obj):
         st.success("Results")
         st.code(json.dumps(et.get("ieee_format", et), indent=2))
         st.code(json.dumps(dp, indent=2))
+
+        # free result holder
+        del result, et, dp
+        gc.collect()
 
     except Exception as exc:
         st.error("Elastic workflow failed.")
