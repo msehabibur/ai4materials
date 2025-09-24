@@ -1,6 +1,8 @@
 # Web UIs
 streamlit>=1.36
 dash>=2.16
+jupyter_packaging>=0.12.4
+build>=1.2
 crystal-toolkit>=2024.3.1
 
 # Materials/ML
