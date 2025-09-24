@@ -31,9 +31,28 @@ try:
     from matgl.ext.ase import PESCalculator, Relaxer
     _MATGL_IMPORT_ERROR: Exception | None = None
 except Exception as exc:  # noqa: BLE001 - surface full error to UI later
+    # Some DGL CPU wheels ship without the optional GraphBolt binary. Despite
+    # setting DGL_LOAD_GRAPHBOLT=0 above, environments may already have the
+    # variable configured differently (e.g., inherited from a parent process).
+    # Retry the import once more with GraphBolt explicitly disabled so that we
+    # can run on CPU-only setups.
     matgl = None  # type: ignore[assignment]
     PESCalculator = Relaxer = None  # type: ignore[assignment]
-    _MATGL_IMPORT_ERROR = exc
+    if isinstance(exc, FileNotFoundError) and "graphbolt" in str(exc).lower():
+        import importlib
+
+        _os.environ["DGL_LOAD_GRAPHBOLT"] = "0"
+        try:
+            matgl = importlib.import_module("matgl")
+            from matgl.ext.ase import PESCalculator, Relaxer  # type: ignore[import]
+
+            _MATGL_IMPORT_ERROR = None
+        except Exception as exc2:  # pragma: no cover - defensive fallback
+            matgl = None  # type: ignore[assignment]
+            PESCalculator = Relaxer = None  # type: ignore[assignment]
+            _MATGL_IMPORT_ERROR = exc2
+    else:
+        _MATGL_IMPORT_ERROR = exc
 
 import matplotlib
 matplotlib.use("Agg")
