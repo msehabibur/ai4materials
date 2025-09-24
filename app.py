@@ -9,8 +9,8 @@ _os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 _os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 _os.environ.setdefault("TORCH_NUM_THREADS", "1")
 
-import os, time, io, warnings, traceback
-from typing import List, Optional, Tuple
+import os, time, io, warnings, traceback, json, uuid
+from typing import List, Tuple
 import numpy as np
 import streamlit as st
 
@@ -74,6 +74,32 @@ def msd_and_plot(positions: np.ndarray, dt_fs: float) -> Tuple[np.ndarray, np.nd
     buf.seek(0)
     return msd, t_ps, buf.read()
 
+
+def render_structure_viewer(structure: Structure, height: int = 480) -> None:
+    """Render a 3D structure viewer using 3Dmol.js embedded in Streamlit."""
+
+    xyz = structure.to(fmt="xyz")
+    xyz_json = json.dumps(xyz)
+    container_id = f"structure-viewer-{uuid.uuid4().hex}"
+
+    html = f"""
+    <div id="{container_id}" style="height: {height}px; position: relative;"></div>
+    <script src="https://3dmol.csb.pitt.edu/build/3Dmol.js"></script>
+    <script>
+    (function() {{
+        var viewer = $3Dmol.createViewer('{container_id}', {{backgroundColor: 'white'}});
+        var xyz = {xyz_json};
+        viewer.addModel(xyz, 'xyz');
+        viewer.setStyle({{}}, {{stick: {{radius: 0.18}}, sphere: {{scale: 0.25}}}});
+        viewer.addUnitCell();
+        viewer.zoomTo();
+        viewer.render();
+    }})();
+    </script>
+    """
+
+    st.components.v1.html(html, height=height)
+
 def try_list_models() -> list[str]:
     try:
         return list(matgl.get_available_pretrained_models())
@@ -110,11 +136,6 @@ with st.sidebar:
     uploaded = st.file_uploader("Upload CIF (or leave empty for demo CsCl)", type=["cif"])
     workdir = st.text_input("Workdir", value=os.path.join(os.getcwd(), "tmp_ml"))
     os.makedirs(workdir, exist_ok=True)
-
-    st.subheader("Crystal Toolkit (optional)")
-    st.write("Run `python ct_viewer.py` in another terminal, then paste its URL:")
-    ct_url = st.text_input("CT URL", value="http://127.0.0.1:8050")
-    show_ct = st.checkbox("Show Crystal Toolkit iframe", value=False)
 
     st.subheader("Model selection / loading")
     avail = try_list_models()
@@ -159,12 +180,35 @@ else:
         "Pm-3m", Lattice.cubic(4.5), ["Cs", "Cl"], [[0, 0, 0], [0.5, 0.5, 0.5]]
     )
 
-st.caption("Current structure:")
-st.code(lattice_caption(structure))
+# Persist the current input structure for reuse in viewer controls
+st.session_state["input_structure"] = structure
 
-if show_ct:
-    st.write(f"Embedding Crystal Toolkit at: {ct_url}")
-    st.components.v1.iframe(ct_url, height=600)
+with st.sidebar:
+    st.subheader("3D Viewer")
+    viewer_options = ["Input structure"]
+    if "relaxed_structure" in st.session_state:
+        viewer_options.append("Relaxed structure")
+    default_choice = st.session_state.get("viewer_selection", viewer_options[0])
+    if default_choice not in viewer_options:
+        default_choice = viewer_options[0]
+    selected = st.radio(
+        "Structure to display",
+        options=viewer_options,
+        index=viewer_options.index(default_choice),
+    )
+    st.session_state["viewer_selection"] = selected
+
+selected_label = st.session_state.get("viewer_selection", "Input structure")
+if selected_label == "Relaxed structure" and "relaxed_structure" in st.session_state:
+    viewer_structure = st.session_state["relaxed_structure"]
+    caption_label = "Relaxed structure"
+else:
+    viewer_structure = structure
+    caption_label = "Input structure"
+
+st.caption(f"Current structure ({caption_label}):")
+st.code(lattice_caption(viewer_structure))
+render_structure_viewer(viewer_structure, height=480)
 
 tab_relax, tab_md, tab_sp = st.tabs(["🔧 Relaxation", "🏃 Molecular Dynamics", "⚡ Single-Point Energy"])
 
