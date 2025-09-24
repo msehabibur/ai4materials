@@ -4,6 +4,7 @@ streamlit>=1.36
 # Materials/ML
 pymatgen>=2024.6.0
 matgl>=0.9.6
+dgl>=2.0.0    # CPU build; install via `pip install dgl`
 ase>=3.23.0    # IMPORTANT: >= 3.23 to provide IsotropicMTKNPT/NHC used by matgl.ext.ase
 
 # Utils / plotting
