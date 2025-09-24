@@ -8,6 +8,9 @@ _os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 _os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 _os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 _os.environ.setdefault("TORCH_NUM_THREADS", "1")
+# GraphBolt is optional for MatGL/DGL and missing binaries raise FileNotFoundError.
+# Disable loading it proactively to keep imports working in CPU-only environments.
+_os.environ.setdefault("DGL_LOAD_GRAPHBOLT", "0")
 
 import os, time, io, warnings, traceback, json, uuid
 from typing import List, Tuple
@@ -23,8 +26,14 @@ from ase import units
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from ase.md.langevin import Langevin
 
-import matgl
-from matgl.ext.ase import PESCalculator, Relaxer
+try:
+    import matgl
+    from matgl.ext.ase import PESCalculator, Relaxer
+    _MATGL_IMPORT_ERROR: Exception | None = None
+except Exception as exc:  # noqa: BLE001 - surface full error to UI later
+    matgl = None  # type: ignore[assignment]
+    PESCalculator = Relaxer = None  # type: ignore[assignment]
+    _MATGL_IMPORT_ERROR = exc
 
 import matplotlib
 matplotlib.use("Agg")
@@ -101,6 +110,9 @@ def render_structure_viewer(structure: Structure, height: int = 480) -> None:
     st.components.v1.html(html, height=height)
 
 def try_list_models() -> list[str]:
+    if matgl is None:
+        return []
+
     try:
         return list(matgl.get_available_pretrained_models())
     except Exception:
@@ -113,6 +125,9 @@ def try_load_model(name_or_path: str):
     After load, move to CPU if .to exists.
     Returns (model, error_message) where error_message is None on success.
     """
+    if matgl is None:
+        return None, f"MatGL is unavailable: {_MATGL_IMPORT_ERROR}"
+
     try:
         model = matgl.load_model(name_or_path)  # <-- no device kwarg here
         # Move to CPU if supported
@@ -130,6 +145,27 @@ def try_load_model(name_or_path: str):
 # ---------------------------
 st.set_page_config(page_title="M3GNet — Relax • MD • Single Point", layout="wide")
 st.title("🔬 M3GNet Suite — Relaxation • MD • Single-Point")
+
+if _MATGL_IMPORT_ERROR is not None:
+    st.error(
+        "MatGL (and its DGL dependency) could not be imported. "
+        "This typically happens when the optional GraphBolt extension is missing."
+    )
+    st.markdown(
+        "- Ensure a CPU build of **dgl** is installed (e.g. `pip install dgl`).\n"
+        "- If GraphBolt remains unavailable, set the environment variable `DGL_LOAD_GRAPHBOLT=0`."
+    )
+    with st.expander("Show full import error"):
+        st.code(
+            "\n".join(
+                traceback.format_exception(
+                    type(_MATGL_IMPORT_ERROR),
+                    _MATGL_IMPORT_ERROR,
+                    _MATGL_IMPORT_ERROR.__traceback__,
+                )
+            )
+        )
+    st.stop()
 
 with st.sidebar:
     st.header("Data & Viewer")
