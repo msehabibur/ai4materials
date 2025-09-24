@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 # ---- single-threaded runtime (set BEFORE imports that spin threads) ----
 import os as _os
 _os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -8,16 +9,17 @@ _os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 _os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 _os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 _os.environ.setdefault("TORCH_NUM_THREADS", "1")
-# GraphBolt is optional for MatGL/DGL and missing binaries raise FileNotFoundError.
-# Disable loading it proactively to keep imports working in CPU-only environments.
+# Some DGL CPU wheels ship without optional GraphBolt; disable proactively.
 _os.environ.setdefault("DGL_LOAD_GRAPHBOLT", "0")
 
-import os, time, io, warnings, traceback, json, uuid
-from typing import List, Tuple
+# ---- stdlib & third-party imports ----
+import os, io, uuid, json, time, warnings, traceback
+from typing import Tuple
+
 import numpy as np
 import streamlit as st
 
-from pymatgen.core import Structure
+from pymatgen.core import Structure, Molecule
 from pymatgen.core.lattice import Lattice
 from pymatgen.io.ase import AseAtomsAdaptor
 
@@ -25,35 +27,32 @@ import ase
 from ase import units
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from ase.md.langevin import Langevin
+from ase.optimize import BFGS
+from ase.io import write as ase_write
 
+# MatGL (graceful import + GraphBolt suppression on retry if needed)
 try:
     import matgl
     from matgl.ext.ase import PESCalculator, Relaxer
     _MATGL_IMPORT_ERROR: Exception | None = None
-except Exception as exc:  # noqa: BLE001 - surface full error to UI later
-    # Some DGL CPU wheels ship without the optional GraphBolt binary. Despite
-    # setting DGL_LOAD_GRAPHBOLT=0 above, environments may already have the
-    # variable configured differently (e.g., inherited from a parent process).
-    # Retry the import once more with GraphBolt explicitly disabled so that we
-    # can run on CPU-only setups.
+except Exception as exc:  # show full detail later in UI
+    import importlib
     matgl = None  # type: ignore[assignment]
     PESCalculator = Relaxer = None  # type: ignore[assignment]
     if isinstance(exc, FileNotFoundError) and "graphbolt" in str(exc).lower():
-        import importlib
-
-        _os.environ["DGL_LOAD_GRAPHBOLT"] = "0"
         try:
+            _os.environ["DGL_LOAD_GRAPHBOLT"] = "0"
             matgl = importlib.import_module("matgl")
-            from matgl.ext.ase import PESCalculator, Relaxer  # type: ignore[import]
-
+            from matgl.ext.ase import PESCalculator, Relaxer  # type: ignore
             _MATGL_IMPORT_ERROR = None
-        except Exception as exc2:  # pragma: no cover - defensive fallback
-            matgl = None  # type: ignore[assignment]
-            PESCalculator = Relaxer = None  # type: ignore[assignment]
+        except Exception as exc2:
+            matgl = None
+            PESCalculator = Relaxer = None
             _MATGL_IMPORT_ERROR = exc2
     else:
         _MATGL_IMPORT_ERROR = exc
 
+# Matplotlib (headless)
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -61,7 +60,7 @@ import matplotlib.pyplot as plt
 warnings.simplefilter("ignore")
 
 # ---------------------------
-# Version guard for ASE
+# Quick sanity guard for ASE
 # ---------------------------
 from packaging import version as _v
 if _v.parse(ase.__version__) < _v.parse("3.23.0"):
@@ -72,20 +71,20 @@ if _v.parse(ase.__version__) < _v.parse("3.23.0"):
 # ---------------------------
 # Helpers
 # ---------------------------
-def save_temp(file_bytes: bytes, name: str, workdir: str) -> str:
-    path = os.path.join(workdir, name)
-    with open(path, "wb") as f:
-        f.write(file_bytes)
-    return path
-
 def lattice_caption(s: Structure) -> str:
     a, b, c = s.lattice.abc
     alpha, beta, gamma = s.lattice.angles
-    return (f"a,b,c = {a:.3f}, {b:.3f}, {c:.3f} Å | "
-            f"α,β,γ = {alpha:.2f}, {beta:.2f}, {gamma:.2f}° | "
-            f"natoms={len(s)}")
+    return (
+        f"a,b,c = {a:.3f}, {b:.3f}, {c:.3f} Å | "
+        f"α,β,γ = {alpha:.2f}, {beta:.2f}, {gamma:.2f}° | "
+        f"natoms={len(s)}"
+    )
 
 def msd_and_plot(positions: np.ndarray, dt_fs: float) -> Tuple[np.ndarray, np.ndarray, bytes]:
+    """
+    positions: shape (n_steps, n_atoms, 3) in Å
+    dt_fs: time step in femtoseconds
+    """
     r0 = positions[0]
     dr = positions - r0
     msd = (dr**2).sum(axis=2).mean(axis=1)
@@ -102,36 +101,62 @@ def msd_and_plot(positions: np.ndarray, dt_fs: float) -> Tuple[np.ndarray, np.nd
     buf.seek(0)
     return msd, t_ps, buf.read()
 
+def render_structure_viewer(structure_or_molecule, height: int = 480) -> None:
+    """
+    3D viewer using 3Dmol.js embedded in Streamlit.
 
-def render_structure_viewer(structure: Structure, height: int = 480) -> None:
-    """Render a 3D structure viewer using 3Dmol.js embedded in Streamlit."""
+    - pymatgen.Structure -> CIF (3Dmol format 'cif'), with unit cell shown
+    - pymatgen.Molecule  -> XYZ (3Dmol format 'xyz')
+    - Fallback: try ASE to XYZ
+    """
+    viewer_format = None
+    text_data = None
+    show_unit_cell = False
 
-    xyz = structure.to(fmt="xyz")
-    xyz_json = json.dumps(xyz)
+    try:
+        if isinstance(structure_or_molecule, Structure):
+            # Structure does NOT support 'xyz' in Structure.to(); use CIF.
+            text_data = structure_or_molecule.to(fmt="cif")
+            viewer_format = "cif"
+            show_unit_cell = True
+        elif isinstance(structure_or_molecule, Molecule):
+            # Molecule supports 'xyz'
+            text_data = structure_or_molecule.to(fmt="xyz")
+            viewer_format = "xyz"
+        else:
+            # Try ASE conversion, then XYZ
+            atoms = AseAtomsAdaptor.get_atoms(structure_or_molecule)
+            buf = io.StringIO()
+            ase_write(buf, atoms, format="xyz")
+            text_data = buf.getvalue()
+            viewer_format = "xyz"
+    except Exception as exc:
+        st.error(f"Failed to serialize structure for viewer: {exc}")
+        return
+
     container_id = f"structure-viewer-{uuid.uuid4().hex}"
+    data_json = json.dumps(text_data)
 
     html = f"""
     <div id="{container_id}" style="height: {height}px; position: relative;"></div>
     <script src="https://3dmol.csb.pitt.edu/build/3Dmol.js"></script>
     <script>
-    (function() {{
+      (function() {{
         var viewer = $3Dmol.createViewer('{container_id}', {{backgroundColor: 'white'}});
-        var xyz = {xyz_json};
-        viewer.addModel(xyz, 'xyz');
+        var data = {data_json};
+        viewer.addModel(data, '{viewer_format}');
         viewer.setStyle({{}}, {{stick: {{radius: 0.18}}, sphere: {{scale: 0.25}}}});
-        viewer.addUnitCell();
+        {"viewer.addUnitCell();" if show_unit_cell else ""}
         viewer.zoomTo();
         viewer.render();
-    }})();
+      }})();
     </script>
     """
-
     st.components.v1.html(html, height=height)
 
 def try_list_models() -> list[str]:
     if matgl is None:
         return []
-
     try:
         return list(matgl.get_available_pretrained_models())
     except Exception:
@@ -146,224 +171,291 @@ def try_load_model(name_or_path: str):
     """
     if matgl is None:
         return None, f"MatGL is unavailable: {_MATGL_IMPORT_ERROR}"
-
     try:
         model = matgl.load_model(name_or_path)  # <-- no device kwarg here
-        # Move to CPU if supported
         try:
             model.to("cpu")  # some matgl models expose .to()
         except Exception:
             pass
         return model, None
-    except Exception as e:
-        tb = traceback.format_exc()
-        return None, f"{e}\n\nTraceback:\n{tb}"
+    except Exception as exc:
+        return None, f"Failed to load model '{name_or_path}': {exc}"
+
+def parse_uploaded_structure(name: str, content: bytes):
+    """Return either Structure or Molecule based on file content."""
+    text = content.decode("utf-8", errors="ignore")
+    lower = name.lower()
+
+    try:
+        if lower.endswith((".cif",)):
+            return Structure.from_str(text, fmt="cif")
+        if lower in ("poscar", "contcar") or "poscar" in lower or "contcar" in lower:
+            return Structure.from_str(text, fmt="poscar")
+        if lower.endswith((".xyz",)):
+            # XYZ => Molecule (non-periodic)
+            return Molecule.from_str(text, fmt="xyz")
+        if lower.endswith((".json", ".mpk", ".mson")):
+            # Pymatgen as_dict formats (Structure or Molecule)
+            obj = Structure.from_str(text, fmt="json")
+            return obj
+    except Exception:
+        pass  # fall through to generic tries
+
+    # Try Structure first, then Molecule
+    for fmt in ("cif", "poscar"):
+        try:
+            return Structure.from_str(text, fmt=fmt)
+        except Exception:
+            continue
+    try:
+        return Molecule.from_str(text, fmt="xyz")
+    except Exception as exc:
+        raise ValueError(f"Could not parse structure/molecule from '{name}': {exc}")
+
+def ensure_periodic_structure(obj):
+    """Convert Molecule to a dummy periodic Structure (large cubic box) if needed."""
+    if isinstance(obj, Structure):
+        return obj
+    if isinstance(obj, Molecule):
+        # Put molecule in a large cubic box (periodic) so ASE/MatGL can run
+        box = Lattice.cubic(30.0)
+        return Structure.from_sites(obj.sites, lattice=box)
+    # try ASE -> Structure
+    atoms = AseAtomsAdaptor.get_atoms(obj)
+    return AseAtomsAdaptor.get_structure(atoms)
+
+def atoms_from(obj):
+    """Get ASE Atoms from Structure or Molecule (Molecule boxed as periodic)."""
+    if isinstance(obj, Molecule):
+        obj = ensure_periodic_structure(obj)
+    if isinstance(obj, Structure):
+        return AseAtomsAdaptor.get_atoms(obj)
+    # Try best-effort
+    return AseAtomsAdaptor.get_atoms(obj)
+
+def download_bytes(filename: str, data: bytes, label: str = "Download") -> None:
+    st.download_button(label=label, data=data, file_name=filename)
 
 # ---------------------------
-# UI Setup
+# UI
 # ---------------------------
-st.set_page_config(page_title="M3GNet — Relax • MD • Single Point", layout="wide")
+st.set_page_config(page_title="M3GNet Suite — Relaxation • MD • Single-Point", layout="wide")
 st.title("🔬 M3GNet Suite — Relaxation • MD • Single-Point")
 
-if _MATGL_IMPORT_ERROR is not None:
-    st.error(
-        "MatGL (and its DGL dependency) could not be imported. "
-        "This typically happens when the optional GraphBolt extension is missing."
-    )
-    st.markdown(
-        "- Ensure a CPU build of **dgl** is installed (e.g. `pip install dgl`).\n"
-        "- If GraphBolt remains unavailable, set the environment variable `DGL_LOAD_GRAPHBOLT=0`."
-    )
-    with st.expander("Show full import error"):
-        st.code(
-            "\n".join(
-                traceback.format_exception(
-                    type(_MATGL_IMPORT_ERROR),
-                    _MATGL_IMPORT_ERROR,
-                    _MATGL_IMPORT_ERROR.__traceback__,
-                )
-            )
-        )
-    st.stop()
-
+# Sidebar: Model selection
 with st.sidebar:
-    st.header("Data & Viewer")
-    uploaded = st.file_uploader("Upload CIF (or leave empty for demo CsCl)", type=["cif"])
-    workdir = st.text_input("Workdir", value=os.path.join(os.getcwd(), "tmp_ml"))
-    os.makedirs(workdir, exist_ok=True)
+    st.header("Model")
+    available = try_list_models()
+    default_model = available[0] if available else "M3GNet-MP-2018.6.1"
+    model_choice = st.selectbox("Choose pretrained PES", [default_model] + [m for m in available if m != default_model])
+    model_path_override = st.text_input("...or load from local path / name", value="")
+    chosen = model_path_override.strip() or model_choice
 
-    st.subheader("Model selection / loading")
-    avail = try_list_models()
-    default_name = "M3GNet-MP-2021.2.8-PES"
-    if avail:
-        model_name = st.selectbox("Pick a pretrained model", options=avail, index=avail.index(default_name) if default_name in avail else 0)
+    model, model_err = try_load_model(chosen)
+    if model_err:
+        st.error(model_err)
+        st.caption("Tip: ensure the model name exists or provide a readable local path.")
     else:
-        st.caption("Could not list pretrained models (no internet or registry blocked). Type a name or local path:")
-        model_name = st.text_input("Model name or local path", value=default_name)
+        st.success(f"Loaded: {chosen}")
 
-    local_override = st.text_input("OR load from local path (folder/file)", value="", help="If provided, this overrides the selected registry model.")
-    load_button = st.button("🔁 Load / Reload model (CPU)")
+# Input structure
+col_up1, col_up2 = st.columns([2, 1], gap="large")
+with col_up1:
+    st.subheader("Current structure (Input structure)")
 
-# ---- model loading (robust) ----
-if "m3gnet_err" not in st.session_state:
-    st.session_state.m3gnet_err = None
-if "m3gnet_pot" not in st.session_state or load_button:
-    chosen = (local_override or model_name).strip()
-    pot, err = try_load_model(chosen)
-    st.session_state.m3gnet_pot = pot
-    st.session_state.m3gnet_err = err
+    uploaded = st.file_uploader("Upload POSCAR/CONTCAR/CIF/XYZ", type=["cif", "POSCAR", "CONTCAR", "xyz", "poscar", "contcar"], accept_multiple_files=False)
+    text_paste = st.text_area("...or paste structure text (POSCAR/CIF/XYZ)", height=180)
 
-if st.session_state.m3gnet_err:
-    st.error("Failed to load model. See details below.")
-    st.code(st.session_state.m3gnet_err)
-    st.stop()
+    pmg_obj = None
+    parse_error = None
+    if uploaded is not None:
+        try:
+            pmg_obj = parse_uploaded_structure(uploaded.name, uploaded.read())
+        except Exception as exc:
+            parse_error = f"{type(exc).__name__}: {exc}"
+    elif text_paste.strip():
+        try:
+            # Name heuristic for parsing hint
+            hint = "POSCAR" if text_paste.strip().splitlines()[0].strip() and len(text_paste.split()) < 30 else "cif"
+            pmg_obj = parse_uploaded_structure(f"pasted.{hint}", text_paste.encode("utf-8"))
+        except Exception as exc:
+            parse_error = f"{type(exc).__name__}: {exc}"
+    else:
+        # Provide a tiny default structure (Si)
+        lat = Lattice.cubic(5.431)
+        pmg_obj = Structure(lat, ["Si", "Si"], [[0, 0, 0], [0.25, 0.25, 0.25]])
+        st.info("No file pasted/uploaded. Using default diamond Si conventional cell.")
 
-pot = st.session_state.m3gnet_pot
-if pot is None:
-    st.warning("No model loaded yet. Choose a model name or local path in the sidebar, then click 'Load / Reload model'.")
-    st.stop()
+    if parse_error:
+        st.error(parse_error)
 
-# ---------------------------
-# Load structure
-# ---------------------------
-if uploaded is not None:
-    cif_path = save_temp(uploaded.getbuffer(), f"{int(time.time())}_{uploaded.name}", workdir)
-    structure = Structure.from_file(cif_path)
-else:
-    # Demo structure: CsCl Pm-3m
-    structure = Structure.from_spacegroup(
-        "Pm-3m", Lattice.cubic(4.5), ["Cs", "Cl"], [[0, 0, 0], [0.5, 0.5, 0.5]]
+    # Show viewer + caption
+    if pmg_obj is not None:
+        if isinstance(pmg_obj, Structure):
+            st.caption(lattice_caption(pmg_obj))
+        else:
+            st.caption(f"Molecule with {len(pmg_obj)} atoms")
+        render_structure_viewer(pmg_obj, height=480)
+
+with col_up2:
+    st.subheader("About")
+    st.markdown(
+        """
+        - **Viewer fix**: Crystals are exported as **CIF** (not XYZ) to 3Dmol, avoiding the `Structure.to(fmt="xyz")` error.
+        - **Molecules**: rendered as **XYZ**.  
+        - **Compute** uses MatGL's **PESCalculator/Relaxer** via ASE.
+        """
     )
+    if _MATGL_IMPORT_ERROR:
+        st.warning(f"MatGL import warning: {_MATGL_IMPORT_ERROR}")
 
-# Persist the current input structure for reuse in viewer controls
-st.session_state["input_structure"] = structure
+st.divider()
 
-with st.sidebar:
-    st.subheader("3D Viewer")
-    viewer_options = ["Input structure"]
-    if "relaxed_structure" in st.session_state:
-        viewer_options.append("Relaxed structure")
-    default_choice = st.session_state.get("viewer_selection", viewer_options[0])
-    if default_choice not in viewer_options:
-        default_choice = viewer_options[0]
-    selected = st.radio(
-        "Structure to display",
-        options=viewer_options,
-        index=viewer_options.index(default_choice),
-    )
-    st.session_state["viewer_selection"] = selected
-
-selected_label = st.session_state.get("viewer_selection", "Input structure")
-if selected_label == "Relaxed structure" and "relaxed_structure" in st.session_state:
-    viewer_structure = st.session_state["relaxed_structure"]
-    caption_label = "Relaxed structure"
-else:
-    viewer_structure = structure
-    caption_label = "Input structure"
-
-st.caption(f"Current structure ({caption_label}):")
-st.code(lattice_caption(viewer_structure))
-render_structure_viewer(viewer_structure, height=480)
-
-tab_relax, tab_md, tab_sp = st.tabs(["🔧 Relaxation", "🏃 Molecular Dynamics", "⚡ Single-Point Energy"])
+# Tabs for workflows
+tab_relax, tab_md, tab_sp = st.tabs(["🔧 Relaxation", "🌡️ MD (NVT, Langevin)", "⚡ Single-point"])
 
 # ---------------------------
-# Relaxation tab (M3GNet Relaxer)
+# Relaxation Tab
 # ---------------------------
 with tab_relax:
-    st.subheader("Structure Relaxation (M3GNet Relaxer)")
-    c1, c2 = st.columns(2)
-    with c1:
-        fmax = st.number_input("Force threshold fmax (eV/Å)", value=0.01, min_value=0.001, step=0.001, format="%.3f")
-    with c2:
-        run_relax = st.button("▶️ Relax")
+    st.subheader("Geometry Optimization (BFGS on M3GNet PES)")
+    col_r1, col_r2 = st.columns(2)
+    with col_r1:
+        fmax = st.number_input("Force convergence (eV/Å)", value=0.05, min_value=0.001, max_value=1.0, step=0.01, format="%.3f")
+        max_steps = st.number_input("Max optimization steps", value=200, min_value=10, max_value=5000, step=10)
+    with col_r2:
+        traj_want = st.checkbox("Record trajectory (XYZ)", value=True)
+        run_relax = st.button("Run Relaxation", use_container_width=True, type="primary", disabled=(model is None or pmg_obj is None))
 
-    if run_relax:
-        relaxer = Relaxer(potential=pot)
-        with st.spinner("Running M3GNet relaxation (CPU)…"):
-            results = relaxer.relax(structure, fmax=float(fmax))
-        final_structure: Structure = results["final_structure"]
-        final_energy = float(results["trajectory"].energies[-1])
+    if run_relax and model is not None and pmg_obj is not None:
+        try:
+            atoms = atoms_from(pmg_obj)
+            atoms.calc = PESCalculator(model=model)
 
-        st.success("Relaxation complete.")
-        st.markdown("**Final structure:**")
-        st.code(lattice_caption(final_structure))
-        st.metric("Total energy (eV)", f"{final_energy:.6f}")
-        st.metric("Energy per atom (eV/atom)", f"{final_energy/len(final_structure):.6f}")
+            traj_positions = []
+            traj_symbols = [a.symbol for a in atoms]
 
-        out_cif = os.path.join(workdir, "relaxed_structure.cif")
-        final_structure.to(fmt="cif", filename=out_cif)
-        with open(out_cif, "rb") as f:
-            st.download_button("⬇️ Download relaxed CIF", f, file_name="relaxed_structure.cif")
+            def _record(a=atoms):
+                traj_positions.append(a.get_positions().copy())
 
-        st.session_state.relaxed_structure = final_structure
+            dyn = BFGS(atoms, logfile=None, maxstep=0.2)
+            dyn.attach(_record, interval=1)
+            dyn.run(fmax=fmax, steps=int(max_steps))
+
+            e_final = atoms.get_potential_energy()
+            f_max = np.abs(atoms.get_forces()).max()
+
+            st.success(f"Optimization finished. E = {e_final:.6f} eV | max|F| = {f_max:.4f} eV/Å")
+
+            # Export final structure
+            final_struct = AseAtomsAdaptor.get_structure(atoms)
+            cif_bytes = final_struct.to(fmt="cif").encode("utf-8")
+            download_bytes("relaxed_structure.cif", cif_bytes, label="⬇️ Download relaxed CIF")
+
+            if traj_want and traj_positions:
+                # Build XYZ trajectory text
+                frames = []
+                for pos in traj_positions:
+                    buf = io.StringIO()
+                    # write a single frame
+                    tmp = atoms.copy()
+                    tmp.set_positions(pos)
+                    ase_write(buf, tmp, format="xyz")
+                    frames.append(buf.getvalue())
+                xyz_traj = "\n".join(frames).encode("utf-8")
+                download_bytes("relaxation_trajectory.xyz", xyz_traj, label="⬇️ Download relaxation trajectory (XYZ)")
+
+        except Exception as exc:
+            st.error("Relaxation failed. See details in the expandable traceback below.")
+            with st.expander("Traceback"):
+                st.code("".join(traceback.format_exception(exc)))
 
 # ---------------------------
-# MD tab (ASE Langevin + PESCalculator)
+# MD Tab
 # ---------------------------
 with tab_md:
-    st.subheader("Molecular Dynamics (ASE Langevin + M3GNet)")
-    use_relaxed = st.checkbox("Start from relaxed (if available)", value=True)
-    start_struct = st.session_state.get("relaxed_structure", structure) if use_relaxed else structure
+    st.subheader("Molecular Dynamics (NVT via Langevin) on M3GNet PES")
+    colm1, colm2, colm3 = st.columns(3)
+    with colm1:
+        T = st.number_input("Temperature (K)", value=300, min_value=1, max_value=3000, step=10)
+        dt_fs = st.number_input("Timestep (fs)", value=1.0, min_value=0.1, max_value=10.0, step=0.1, format="%.1f")
+    with colm2:
+        steps = st.number_input("MD steps", value=2000, min_value=10, max_value=200000, step=100)
+        friction = st.number_input("Friction γ (1/ps)", value=1.0, min_value=0.01, max_value=100.0, step=0.1, format="%.2f")
+    with colm3:
+        save_xyz = st.checkbox("Save trajectory (XYZ)", value=True)
+        run_md = st.button("Run MD", use_container_width=True, type="primary", disabled=(model is None or pmg_obj is None))
 
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        T = st.number_input("Temperature (K)", value=300, min_value=1)
-    with c2:
-        steps = st.number_input("Steps", value=500, min_value=10, step=50)
-    with c3:
-        dt_fs = st.number_input("Timestep (fs)", value=1.0, min_value=0.1, step=0.1, format="%.1f")
-    with c4:
-        friction = st.number_input("Friction (1/ps)", value=0.01, min_value=0.0, step=0.01, format="%.2f")
-    run_md = st.button("▶️ Run MD")
+    if run_md and model is not None and pmg_obj is not None:
+        try:
+            atoms = atoms_from(pmg_obj)
+            atoms.calc = PESCalculator(model=model)
 
-    if run_md:
-        adaptor = AseAtomsAdaptor()
-        atoms = adaptor.get_atoms(start_struct)
-        atoms.set_calculator(PESCalculator(pot))
+            # Initialize velocities
+            MaxwellBoltzmannDistribution(atoms, temperature_K=float(T))
 
-        MaxwellBoltzmannDistribution(atoms, temperature_K=float(T), force_temp=True)
+            # Langevin thermostat: friction in 1/ps -> convert to ASE units (1/fs)
+            gamma_fs = float(friction) / 1000.0  # 1/ps -> 1/fs
+            dyn = Langevin(atoms, timestep=float(dt_fs) * units.fs, temperature_K=float(T), friction=gamma_fs)
 
-        gamma = float(friction) / 1e-12  # 1/ps -> 1/s
-        dyn = Langevin(atoms, timestep=float(dt_fs) * units.fs, temperature_K=float(T), friction=gamma)
+            positions = []
+            symbols = [a.symbol for a in atoms]
 
-        positions: List[np.ndarray] = [atoms.get_positions().copy()]
-        prog = st.progress(0)
-        status = st.empty()
-        with st.spinner("Running MD (CPU)…"):
-            total = int(steps)
-            for i in range(total):
-                dyn.run(1)
+            def _snapshot():
                 positions.append(atoms.get_positions().copy())
-                if i % max(1, total // 100) == 0:
-                    prog.progress(int((i + 1) / total * 100))
-                    status.text(f"Step {i + 1}/{total}")
 
-        prog.progress(100)
-        status.text("MD finished.")
+            dyn.attach(_snapshot, interval=1)
+            dyn.run(int(steps))
 
-        positions_arr = np.stack(positions, axis=0)
-        msd, t_ps, png = msd_and_plot(positions_arr, dt_fs=float(dt_fs))
-        st.image(png, caption="MSD vs time", use_column_width=True)
-        st.metric("Final potential energy (eV)", f"{atoms.get_potential_energy():.6f}")
+            positions = np.array(positions)  # (n_steps, n_atoms, 3)
+            msd, t_ps, png = msd_and_plot(positions, float(dt_fs))
+            st.image(png, caption="MSD vs Time", use_container_width=True)
 
-        msd_csv = "time_ps,msd_A2\n" + "\n".join(f"{t:.6f},{v:.6f}" for t, v in zip(t_ps, msd))
-        st.download_button("⬇️ Download MSD (CSV)", data=msd_csv, file_name="msd.csv", mime="text/csv")
+            # Export last frame + full trajectory if desired
+            if save_xyz:
+                buf = io.StringIO()
+                for pos in positions:
+                    tmp = atoms.copy()
+                    tmp.set_positions(pos)
+                    ase_write(buf, tmp, format="xyz")
+                download_bytes("md_trajectory.xyz", buf.getvalue().encode("utf-8"), label="⬇️ Download MD trajectory (XYZ)")
+
+            # Export final structure
+            atoms.set_positions(positions[-1])
+            final_struct = AseAtomsAdaptor.get_structure(atoms)
+            cif_bytes = final_struct.to(fmt="cif").encode("utf-8")
+            download_bytes("md_last_frame.cif", cif_bytes, label="⬇️ Download last frame (CIF)")
+
+        except Exception as exc:
+            st.error("MD failed. See details in the expandable traceback below.")
+            with st.expander("Traceback"):
+                st.code("".join(traceback.format_exception(exc)))
 
 # ---------------------------
-# Single-Point tab
+# Single-point Tab
 # ---------------------------
 with tab_sp:
-    st.subheader("Single-Point Energy (PESCalculator)")
-    target_struct = st.session_state.get("relaxed_structure", structure)
-    st.caption("Target structure:")
-    st.code(lattice_caption(target_struct))
+    st.subheader("Single-point Energy / Forces")
+    run_sp = st.button("Run Single-point", use_container_width=True, type="primary", disabled=(model is None or pmg_obj is None))
 
-    do_sp = st.button("⚡ Compute energy")
-    if do_sp:
-        atoms = AseAtomsAdaptor.get_atoms(target_struct)
-        atoms.set_calculator(PESCalculator(pot))
-        e = atoms.get_potential_energy()  # eV
-        st.success("Single-point complete.")
-        st.metric("Total energy (eV)", f"{e:.6f}")
-        st.metric("Energy per atom (eV/atom)", f"{e/len(target_struct):.6f}")
+    if run_sp and model is not None and pmg_obj is not None:
+        try:
+            atoms = atoms_from(pmg_obj)
+            atoms.calc = PESCalculator(model=model)
+            e = atoms.get_potential_energy()
+            f = atoms.get_forces()
+            st.success(f"E = {e:.6f} eV | max|F| = {np.abs(f).max():.4f} eV/Å")
+
+            # Save forces as CSV
+            import pandas as pd
+            df = pd.DataFrame(f, columns=["Fx (eV/Å)", "Fy (eV/Å)", "Fz (eV/Å)"])
+            csv = df.to_csv(index=False).encode("utf-8")
+            download_bytes("single_point_forces.csv", csv, label="⬇️ Download forces (CSV)")
+
+        except Exception as exc:
+            st.error("Single-point failed. See details in the expandable traceback below.")
+            with st.expander("Traceback"):
+                st.code("".join(traceback.format_exception(exc)))
+
+# Footer note
+st.caption("Note: For crystals, viewer uses CIF (not XYZ). Molecules render as XYZ. This avoids pymatgen Structure.to(fmt='xyz') errors and works smoothly with 3Dmol.")
