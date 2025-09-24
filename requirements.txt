@@ -1,4 +1,3 @@
-iohappyeyeballs==2.4.4
 aiohttp==3.11.11
 torch==2.2.1
 torchdata==0.7.1
