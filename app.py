@@ -330,7 +330,9 @@ with tab_relax:
     if run_relax and model is not None and pmg_obj is not None:
         try:
             atoms = atoms_from(pmg_obj)
-            atoms.calc = PESCalculator(model=model)
+            #atoms.calc = PESCalculator(model=model)
+            atoms.calc = PESCalculator(model=model, potential="M3GNet-MP-2018.6.1")
+
 
             traj_positions = []
             traj_symbols = [a.symbol for a in atoms]
