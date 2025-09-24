@@ -1,5 +1,5 @@
 from __future__ import annotations
-import io, csv, traceback
+import io, csv, gc, traceback
 import streamlit as st
 
 def _lazy_import():
@@ -20,9 +20,9 @@ def phonon_tab(pmg_obj):
 
     col1, col2 = st.columns(2)
     with col1:
-        min_len = st.number_input("Supercell min length (Å)", value=15.0, min_value=8.0, max_value=30.0, step=0.5)
+        min_len = st.number_input("Supercell min length (Å)", value=12.0, min_value=8.0, max_value=25.0, step=0.5)
     with col2:
-        store_fc = st.checkbox("Store force constants", value=False)
+        store_fc = st.checkbox("Store force constants (bigger RAM)", value=False)
 
     run = st.button("Run Phonon Workflow", type="primary", disabled=(pmg_obj is None))
     if not run:
@@ -46,6 +46,7 @@ def phonon_tab(pmg_obj):
             load=True,
             sort={"completed_at": -1},
         )
+
         if not result:
             st.warning("No phonon results found yet.")
             return
@@ -58,6 +59,10 @@ def phonon_tab(pmg_obj):
 
         ph_bs = PhononBandStructureSymmLine.from_dict(result['output']['phonon_bandstructure'])
         ph_dos = PhononDos.from_dict(result['output']['phonon_dos'])
+
+        # Free the huge dict early
+        del result
+        gc.collect()
 
         # DOS plot
         dos_plot = PhononDosPlotter()
@@ -104,10 +109,13 @@ def phonon_tab(pmg_obj):
             writer.writerow([label, dist])
         st.download_button("⬇️ Download Phonon Bands (CSV)", bs_csv.getvalue().encode(), file_name="phonon_bandstructure.csv")
 
-        st.success("Phonon analyses complete and files exported.")
+        # Free plotting objects
+        del ph_bs, ph_dos, bands, bands_T, distances, fig_bs, fig_dos
+        gc.collect()
+
+        st.success("Phonon analyses complete. Defaults tuned for low memory.")
 
     except Exception as exc:
         st.error("Phonon workflow failed.")
         with st.expander("Traceback"):
             st.code("".join(traceback.format_exception(exc)))
-
