@@ -3,6 +3,8 @@ aiohttp==3.11.11
 torch==2.2.1
 aiosignal==1.3.2
 altair==5.5.0
+mace-torch
+mace-models
 py3Dmol
 openpyxl
 scikit-learn==1.6.1
