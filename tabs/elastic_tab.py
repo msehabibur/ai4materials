@@ -6,12 +6,20 @@ import streamlit as st
 
 def _lazy_import():
     try:
-        from atomate2.forcefields.jobs import CHGNetRelaxMaker
+        from atomate2.forcefields.jobs import CHGNetRelaxMaker as _CHG
+    except Exception:
+        _CHG = None
+    try:
+        from atomate2.forcefields.jobs import MACERelaxMaker as _MACE
+    except Exception:
+        _MACE = None
+
+    try:
         from atomate2.forcefields.flows.elastic import ElasticMaker
         from jobflow import run_locally, SETTINGS
-        return CHGNetRelaxMaker, ElasticMaker, run_locally, SETTINGS, None
+        return _CHG, _MACE, ElasticMaker, run_locally, SETTINGS, None
     except Exception as exc:
-        return None, None, None, None, exc
+        return None, None, None, None, None, exc
 
 def _guess_scale_to_gpa(C):
     arr = np.abs(np.array(C, dtype=float))
@@ -22,32 +30,36 @@ def _guess_scale_to_gpa(C):
 
 def _pretty_tensor_GPa(C):
     arr = np.array(C, dtype=float)
-    s, units = _guess_scale_to_gpa(arr)
+    s, _ = _guess_scale_to_gpa(arr)
     arr = arr * s
     lines = ["Elastic tensor C_ij (GPa):"]
     for row in arr:
         lines.append("  " + "  ".join(f"{v:10.3f}" for v in row))
-    return "\n".join(lines), units
+    return "\n".join(lines)
 
 def _scale_props_to_gpa(props):
-    if not props: return props, "GPa"
+    if not props: return props
     candidates = [props.get("k_vrh"), props.get("g_vrh"), props.get("y_mod")]
     rep = [float(x) for x in candidates if isinstance(x, (int,float))]
-    units = "GPa"; s = 1.0
+    s = 1.0
     if rep:
         med = np.median(np.abs(rep))
-        if med > 1e9: s, units = 1/1e9, "Pa"
-        elif med > 1e4: s, units = 1/1e3, "MPa"
+        if med > 1e9: s = 1/1e9
+        elif med > 1e4: s = 1/1e3
     out = {}
     for k,v in props.items():
         if v is None: out[k] = None; continue
         try:
-            out[k] = float(v) * s if k != "homogeneous_poisson" and "anisotropy" not in k else float(v)
+            # dimensionless stay as-is
+            if k in ("homogeneous_poisson", "universal_anisotropy"):
+                out[k] = float(v)
+            else:
+                out[k] = float(v) * s
         except Exception:
             out[k] = v
-    return out, units
+    return out
 
-def _pretty_moduli(props_gpa, units_detected):
+def _pretty_moduli(props_gpa):
     fields = [
         ("k_voigt", "Bulk K_V (GPa)"),
         ("k_reuss", "Bulk K_R (GPa)"),
@@ -59,7 +71,7 @@ def _pretty_moduli(props_gpa, units_detected):
         ("homogeneous_poisson", "Poisson ratio (–)"),
         ("universal_anisotropy", "Universal anisotropy (–)"),
     ]
-    lines = [f"Detected units: {units_detected} → shown in GPa"]
+    lines = []
     warn_negative = False
     for key, label in fields:
         val = props_gpa.get(key, None)
@@ -80,23 +92,18 @@ def _pretty_moduli(props_gpa, units_detected):
 
 def elastic_tab(pmg_obj, model_family: str, low_mem: bool):
     st.subheader("Elastic Properties")
-    CHGNetRelaxMaker, ElasticMaker, run_locally, SETTINGS, err = _lazy_import()
+    CHG, MACE, ElasticMaker, run_locally, SETTINGS, err = _lazy_import()
     if err:
         st.error("Dependencies missing. Ensure: atomate2[phonons,forcefields], jobflow, phonopy, spglib.")
         st.code(str(err)); return
 
-    if model_family != "CHGNet":
-        st.info("Elastic flow uses Atomate2 force-field workflows which currently support CHGNet. "
-                "Switch family to CHGNet in the sidebar to enable this tab.")
-        return
-
-    # Slightly looser default fmax for per-deformation relax in low-mem mode
-    default_fmax = 2e-4 if low_mem else 1e-4
-
+    # ↓ very small fmax accepted; show with 6 decimals
+    default_fmax = 0.000100 if low_mem else 0.000050
     col1, col2 = st.columns(2)
     with col1:
-        fmax = st.number_input("Relax fmax (eV/Å)", value=float(default_fmax), min_value=1e-6, max_value=1e-2,
-                               step=1e-4, format="%.6f", key="el_fmax")
+        fmax = st.number_input("Relax fmax (eV/Å)",
+                               value=float(default_fmax), min_value=0.000001, max_value=0.01,
+                               step=0.000001, format="%.6f", key="el_fmax")
     with col2:
         run = st.button("Run elastic workflow", type="primary", disabled=(pmg_obj is None), key="el_run")
     if not run: return
@@ -105,18 +112,30 @@ def elastic_tab(pmg_obj, model_family: str, low_mem: bool):
     pct_label = st.empty()
 
     try:
+        # Auto-pick relax makers based on selected family, fall back if missing
+        fam = (model_family or "CHGNet").strip().lower()
+        def _pick_relax_maker(relax_cell: bool):
+            if fam == "mace" and MACE is not None:
+                return MACE(relax_cell=relax_cell, relax_kwargs={"fmax": float(fmax)})
+            if fam == "chgnet" and CHG is not None:
+                return CHG(relax_cell=relax_cell, relax_kwargs={"fmax": float(fmax)})
+            # fallback: whichever exists
+            if MACE is not None:
+                return MACE(relax_cell=relax_cell, relax_kwargs={"fmax": float(fmax)})
+            if CHG is not None:
+                return CHG(relax_cell=relax_cell, relax_kwargs={"fmax": float(fmax)})
+            return None  # let ElasticMaker decide (will raise if none available)
+
         progress.progress(10, text="Preparing flow…"); pct_label.write("**Progress:** 10%")
         flow = ElasticMaker(
-            bulk_relax_maker=CHGNetRelaxMaker(relax_cell=True,  relax_kwargs={"fmax": float(fmax)}),
-            elastic_relax_maker=CHGNetRelaxMaker(relax_cell=False, relax_kwargs={"fmax": float(fmax)}),
+            bulk_relax_maker=_pick_relax_maker(relax_cell=True),
+            elastic_relax_maker=_pick_relax_maker(relax_cell=False),
         ).make(structure=pmg_obj)
 
         progress.progress(30, text="Running deformations…"); pct_label.write("**Progress:** 30%")
         _ = run_locally(flow, create_folders=True)
 
         progress.progress(85, text="Fitting elastic tensor…"); pct_label.write("**Progress:** 85%")
-        time.sleep(0.2)
-
         store = SETTINGS.JOB_STORE
         store.connect()
         result = store.query_one(
@@ -135,11 +154,8 @@ def elastic_tab(pmg_obj, model_family: str, low_mem: bool):
         dp = result["output"]["derived_properties"]
 
         tensor_to_show = et.get("ieee_format", et)
-        tensor_text, units_t = _pretty_tensor_GPa(tensor_to_show)
-        props_scaled, units_p = _scale_props_to_gpa(dp)
-
-        st.code(tensor_text)
-        st.code(_pretty_moduli(props_scaled, units_p))
+        st.code(_pretty_tensor_GPa(tensor_to_show))
+        st.code(_pretty_moduli(_scale_props_to_gpa(dp)))
 
         del result, et, dp
         gc.collect()
