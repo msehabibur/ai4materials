@@ -85,9 +85,6 @@ urllib3==2.3.0
 wheel==0.45.1
 yarl==1.18.3
 
-# ── minimal changes start here ────────────────────────────────────────────
-# add explicit phonon deps
-phonopy==2.22.3
 
 # pin atomate2 + jobflow (phonons + forcefields)
 atomate2[phonons]
