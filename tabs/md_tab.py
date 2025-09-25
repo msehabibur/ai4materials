@@ -16,6 +16,7 @@ from core.model import get_calculator
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+from matplotlib.ticker import ScalarFormatter
 
 # session keys
 _MSD_PLOT_KEY = "md_msd_png"
@@ -34,31 +35,35 @@ def _plot_msd(msd_vals, dt_fs: float) -> bytes | None:
     plt.rcParams.update({"font.size": 18})
     fig = plt.figure(figsize=(5.0, 3.6))
     ax = plt.gca()
-    ax.ticklabel_format(style="plain", axis="y", useOffset=False)
-    ax.yaxis.get_major_formatter().set_scientific(False)
-    ax.yaxis.get_major_formatter().set_useOffset(False)
+    sf = ScalarFormatter(useMathText=False); sf.set_scientific(False); sf.set_useOffset(False)
+    ax.yaxis.set_major_formatter(sf)
     t_ps = np.arange(len(msd_vals)) * float(dt_fs) / 1000.0
     ax.plot(t_ps, msd_vals, linewidth=2)
     ax.set_xlabel("Time (ps)"); ax.set_ylabel("MSD (Å$^2$)"); ax.set_title("Mean Squared Displacement")
     buf = io.BytesIO(); fig.savefig(buf, dpi=160, bbox_inches="tight"); plt.close(fig)
     buf.seek(0); return buf.read()
 
-def _make_traj_gif(xyz_path: str, forced_symbols: str | None = None) -> bytes:
+def _make_traj_gif(xyz_path: str, forced_symbols: str | None = None) -> tuple[bytes, int]:
+    """Return (gif_bytes, n_frames)."""
     try:
-        atoms_list = ase_read(xyz_path, index=":")
+        atoms_list = ase_read(xyz_path, index=":")  # loads frames; keep system modest on Cloud
         if forced_symbols:
             for a in atoms_list: a.set_chemical_symbols(forced_symbols)
+        n = len(atoms_list)
+        if n < 2:
+            return b"", n
         fig, ax = plt.subplots(figsize=(4, 4))
         def update(i):
             ax.clear()
             from ase.visualize.plot import plot_atoms
             plot_atoms(atoms_list[i], ax, radii=0.8, rotation=("45x,45y,0z"))
             ax.set_title(f"Frame {i + 1}"); ax.axis("off")
-        ani = FuncAnimation(fig, update, frames=len(atoms_list), interval=200)
+        ani = FuncAnimation(fig, update, frames=n, interval=200)
         buf = io.BytesIO(); ani.save(buf, writer="pillow", dpi=200, fps=60); plt.close(fig)
-        buf.seek(0); return buf.read()
+        buf.seek(0)
+        return buf.read(), n
     except Exception:
-        return b""
+        return b"", 0
 
 def md_tab(pmg_obj, model_family: str, variant: str):
     st.subheader("Molecular Dynamics")
@@ -104,7 +109,10 @@ def md_tab(pmg_obj, model_family: str, variant: str):
     with c5:
         stride = st.number_input("Save every Nth step", value=25, min_value=1, max_value=1000, step=1, key="md_stride")
     with c6:
-        make_gif = st.checkbox("Render GIF animation", value=False, key="md_makegif")
+        # Render GIF only if XYZ streaming is enabled
+        make_gif = st.checkbox("Render GIF animation", value=False, key="md_makegif", disabled=not save_xyz)
+        if not save_xyz:
+            st.caption("Enable “Stream trajectory to XYZ” to render an animation.")
 
     if pmg_obj is None:
         st.info("Upload a structure to run MD."); return
@@ -160,27 +168,37 @@ def md_tab(pmg_obj, model_family: str, variant: str):
 
         progress.progress(100, text="Done"); pct_label.write("**Progress:** 100%")
 
-        # Persist artifacts to session state
+        # Persist MSD plot
         st.session_state[_MSD_PLOT_KEY] = _plot_msd(msd_state["msd"], float(dt_fs))
         if st.session_state[_MSD_PLOT_KEY]:
             st.image(st.session_state[_MSD_PLOT_KEY], caption="MSD vs time", use_container_width=False)
 
+        # Persist final frame
         final_struct = AseAtomsAdaptor.get_structure(atoms)
         st.session_state[_MD_LAST_CIF] = final_struct.to(fmt="cif").encode()
         st.download_button("⬇️ Download last frame (CIF)", st.session_state[_MD_LAST_CIF],
                            file_name="md_last_frame.cif", key="md_dl_cif")
 
+        # Handle trajectory artifacts
         if tmp_path:
             with open(tmp_path, "rb") as fh:
-                st.session_state[_MD_XYZ] = fh.read()
+                data = fh.read()
+            st.session_state[_MD_XYZ] = data
             st.download_button("⬇️ Download trajectory (XYZ, streamed)", st.session_state[_MD_XYZ],
                                file_name="md_trajectory.xyz", key="md_dl_xyz")
+
             if make_gif:
-                st.session_state[_MD_GIF] = _make_traj_gif(tmp_path, forced_symbols=None)
-                if st.session_state[_MD_GIF]:
-                    st.image(st.session_state[_MD_GIF], caption="Trajectory animation (GIF)", use_container_width=False)
+                gif_bytes, n_frames = _make_traj_gif(tmp_path, forced_symbols=None)
+                if n_frames < 2:
+                    st.info("No frames to animate. Increase MD steps or lower the 'Save every Nth step' value.")
+                elif gif_bytes:
+                    st.session_state[_MD_GIF] = gif_bytes
+                    st.image(st.session_state[_MD_GIF], caption=f"Trajectory animation (GIF) — {n_frames} frames",
+                             use_container_width=False)
                     st.download_button("⬇️ Download GIF", st.session_state[_MD_GIF],
                                        file_name="md_trajectory.gif", key="md_dl_gif")
+                else:
+                    st.warning("Animation skipped (encoding failed or memory limit). Try fewer frames or a smaller system.")
 
     except Exception as exc:
         st.error(f"MD failed: {exc}")
