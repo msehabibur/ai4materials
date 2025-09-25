@@ -14,6 +14,7 @@ except Exception:
     NPTBerendsen = None
 
 from ase.io import write as ase_write, read as ase_read
+from ase.io.trajectory import Trajectory
 from pymatgen.io.ase import AseAtomsAdaptor
 
 from core.struct import atoms_from
@@ -30,6 +31,7 @@ _MSD_PLOT_KEY = "md_msd_png"
 _MD_LAST_CIF  = "md_last_cif"
 _MD_XYZ       = "md_traj_xyz"
 _MD_GIF       = "md_traj_gif"
+_MD_TRAJ      = "md_traj_ase"  # .traj bytes for download
 
 def _ensure_tmp_list():
     if "tmp_paths" not in st.session_state:
@@ -67,14 +69,13 @@ def _plot_msd(msd_vals, dt_fs: float) -> bytes | None:
     buf.seek(0)
     return buf.read()
 
-def _make_traj_gif(xyz_path: str, forced_symbols: str | None = None) -> tuple[bytes, int]:
-    """Build an animated GIF from an XYZ trajectory. Returns (gif_bytes, n_frames)."""
+def _make_traj_gif_from_frames(frames, forced_symbols: str | None = None) -> tuple[bytes, int]:
+    """Build an animated GIF from a list of ASE Atoms frames. Returns (gif_bytes, n_frames)."""
     try:
-        atoms_list = ase_read(xyz_path, index=":")  # loads all frames
         if forced_symbols:
-            for a in atoms_list:
+            for a in frames:
                 a.set_chemical_symbols(forced_symbols)
-        n = len(atoms_list)
+        n = len(frames)
         if n < 2:
             return b"", n
 
@@ -83,7 +84,7 @@ def _make_traj_gif(xyz_path: str, forced_symbols: str | None = None) -> tuple[by
 
         def update(i):
             ax.clear()
-            plot_atoms(atoms_list[i], ax, radii=0.8, rotation=("45x,45y,0z"))
+            plot_atoms(frames[i], ax, radii=0.8, rotation=("45x,45y,0z"))
             ax.set_title(f"Frame {i + 1}")
             ax.axis("off")
 
@@ -108,6 +109,9 @@ def md_tab(pmg_obj, model_family: str, variant: str):
     if st.session_state.get(_MD_LAST_CIF):
         st.download_button("⬇️ Download last frame (CIF)", st.session_state[_MD_LAST_CIF],
                            "md_last_frame.cif", key="md_dl_cif_persist")
+    if st.session_state.get(_MD_TRAJ):
+        st.download_button("⬇️ Download ASE trajectory (.traj)", st.session_state[_MD_TRAJ],
+                           "md_trajectory.traj", key="md_dl_traj_persist")
     if st.session_state.get(_MD_XYZ):
         st.download_button("⬇️ Download trajectory (XYZ)", st.session_state[_MD_XYZ],
                            "md_trajectory.xyz", key="md_dl_xyz_persist")
@@ -138,13 +142,12 @@ def md_tab(pmg_obj, model_family: str, variant: str):
 
     c4, c5, c6 = st.columns(3)
     with c4:
-        save_xyz = st.checkbox("Stream trajectory to XYZ", value=False, key="md_savexyz")
+        save_xyz = st.checkbox("Stream trajectory to XYZ (downloadable)", value=False, key="md_savexyz")
     with c5:
         stride = st.number_input("Save every Nth step", value=25, min_value=1, max_value=1000, step=1, key="md_stride")
     with c6:
-        make_gif = st.checkbox("Render GIF animation", value=False, key="md_makegif", disabled=not save_xyz)
-        if not save_xyz:
-            st.caption("Enable “Stream trajectory to XYZ” to render an animation.")
+        make_gif = st.checkbox("Render GIF animation", value=False, key="md_makegif")
+        st.caption("GIF is built from a robust internal .traj stream (independent of XYZ).")
 
     if pmg_obj is None:
         st.info("Upload a structure to run MD.")
@@ -185,15 +188,28 @@ def md_tab(pmg_obj, model_family: str, variant: str):
         pct_label = st.empty()
         msd_state = _online_msd_state()
 
-        # ---- Trajectory file (write an initial frame, then append each stride) ----
-        tmp_path = None
+        # ---- Trajectory writers ----
+        # Robust internal writer: ASE .traj (always used if we need GIF or XYZ)
+        need_frames = make_gif or save_xyz
+        traj_path = None
+        traj_writer = None
+        if need_frames:
+            traj_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".traj")
+            traj_path = traj_tmp.name
+            traj_tmp.close()
+            st.session_state.tmp_paths.append(traj_path)
+            traj_writer = Trajectory(traj_path, "w", atoms)
+            traj_writer.write(atoms)  # initial frame
+
+        # Optional external XYZ stream for user download
+        xyz_path = None
         if save_xyz:
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xyz")
-            tmp_path = tmp.name
-            tmp.close()
-            st.session_state.tmp_paths.append(tmp_path)
-            # Initial frame ensures ≥1 frame even before stepping
-            ase_write(tmp_path, atoms, format="xyz", append=False)
+            xyz_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xyz")
+            xyz_path = xyz_tmp.name
+            xyz_tmp.close()
+            st.session_state.tmp_paths.append(xyz_path)
+            # initial frame in EXTXYZ (more robust than plain xyz)
+            ase_write(xyz_path, atoms, format="extxyz", append=False)
 
         # ---- Callback each MD step ----
         step_idx = {"i": 0}
@@ -206,9 +222,10 @@ def md_tab(pmg_obj, model_family: str, variant: str):
             pos = atoms.get_positions()
             _online_msd_update(msd_state, pos)
 
-            if save_xyz and (i % int(st.session_state.get("md_stride", 25)) == 0):
-                # Append a properly formatted XYZ frame (ASE handles headers/splits)
-                ase_write(tmp_path, atoms, format="xyz", append=True)
+            if need_frames and (i % int(st.session_state.get("md_stride", 25)) == 0):
+                traj_writer.write(atoms)
+                if save_xyz:
+                    ase_write(xyz_path, atoms, format="extxyz", append=True)
 
             pct = min(int(100 * i / steps), 99)
             progress.progress(pct, text=f"MD running… {pct}%")
@@ -218,6 +235,11 @@ def md_tab(pmg_obj, model_family: str, variant: str):
 
         # ---- Run MD ----
         dyn.run(int(steps))
+
+        # ---- Close trajectory writer ----
+        if traj_writer is not None:
+            try: traj_writer.close()
+            except Exception: pass
 
         progress.progress(100, text="Done")
         pct_label.write("**Progress:** 100%")
@@ -233,18 +255,30 @@ def md_tab(pmg_obj, model_family: str, variant: str):
         st.download_button("⬇️ Download last frame (CIF)", st.session_state[_MD_LAST_CIF],
                            file_name="md_last_frame.cif", key="md_dl_cif")
 
-        # ---- Handle trajectory artifacts (XYZ + optional GIF) ----
-        if tmp_path:
-            with open(tmp_path, "rb") as fh:
+        # ---- Downloads + GIF ----
+        # .traj bytes for download
+        if traj_path and os.path.exists(traj_path):
+            with open(traj_path, "rb") as fh:
+                st.session_state[_MD_TRAJ] = fh.read()
+            st.download_button("⬇️ Download ASE trajectory (.traj)", st.session_state[_MD_TRAJ],
+                               file_name="md_trajectory.traj", key="md_dl_traj")
+
+        # optional XYZ
+        if xyz_path and os.path.exists(xyz_path):
+            with open(xyz_path, "rb") as fh:
                 st.session_state[_MD_XYZ] = fh.read()
             st.download_button("⬇️ Download trajectory (XYZ)", st.session_state[_MD_XYZ],
                                file_name="md_trajectory.xyz", key="md_dl_xyz")
 
-            if make_gif:
-                gif_bytes, n_frames = _make_traj_gif(tmp_path, forced_symbols=None)
-                if n_frames < 2:
-                    st.info("No frames to animate. Increase MD steps or lower the 'Save every Nth step' value.")
-                elif gif_bytes:
+        # GIF built from robust .traj
+        if make_gif and traj_path and os.path.exists(traj_path):
+            frames = ase_read(traj_path, index=":")  # always parses multi-frame properly
+            n_frames = len(frames)
+            if n_frames < 2:
+                st.info("No frames to animate. Increase MD steps or lower the 'Save every Nth step' value.")
+            else:
+                gif_bytes, n_built = _make_traj_gif_from_frames(frames, forced_symbols=None)
+                if n_built >= 2 and gif_bytes:
                     st.session_state[_MD_GIF] = gif_bytes
                     st.image(st.session_state[_MD_GIF],
                              caption=f"Trajectory animation (GIF) — {n_frames} frames",
