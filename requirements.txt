@@ -87,6 +87,7 @@ yarl==1.18.3
 
 
 # pin atomate2 + jobflow (phonons + forcefields)
+atomate2
 atomate2[phonons]
 atomate2[lobster]
 atomate2[forcefields]
