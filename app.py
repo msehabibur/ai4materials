@@ -1,182 +1,186 @@
-# tabs/relax_tab.py
+# app.py (SAFE BOOT VERSION)
 from __future__ import annotations
-import io
+import os
+import importlib
 import traceback
-import numpy as np
 import streamlit as st
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+# --- Page setup early so UI renders even if later imports fail ---
+st.set_page_config(page_title="Materials Studio", layout="wide")
+st.title("🧪 Materials Studio")
 
-from pymatgen.io.ase import AseAtomsAdaptor
-from pymatgen.core import Structure
+# ---------------- Session state defaults ----------------
+st.session_state.setdefault("stop_requested", False)
+st.session_state.setdefault("tmp_paths", [])
+st.session_state.setdefault("relaxed_cif", None)
+st.session_state.setdefault("relax_traj_xyz", None)
 
-from ase.optimize import BFGS, LBFGS, FIRE
-from ase.constraints import StrainFilter, UnitCellFilter
-from ase.io import write as ase_write
-from ase.optimize.optimize import Optimizer
-
-from core.struct import atoms_from
-from core.model import get_calculator
-
-
-def _lattice_summary(s: Structure) -> str:
-    a, b, c = s.lattice.abc
-    α, β, γ = s.lattice.angles
-    return f"a={a:.3f}, b={b:.3f}, c={c:.3f} Å | α={α:.2f}, β={β:.2f}, γ={γ:.2f}°"
-
-
-def _plot_energy(energies):
-    if not energies:
-        return None
-    plt.rcParams.update({"font.size": 22})
-    fig = plt.figure(figsize=(6.0, 4.5))
-    xs = np.arange(len(energies))
-    plt.plot(xs, energies, marker="o", linewidth=2)
-    plt.xlabel("Optimization step")
-    plt.ylabel("Energy (eV)")
-    plt.title("Energy vs step")
-    buf = io.BytesIO()
-    fig.savefig(buf, dpi=180, bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return buf.read()
-
-
-def _make_optimizer(name: str, atoms_or_filter) -> Optimizer:
-    if name == "BFGS":
-        return BFGS(atoms_or_filter, logfile=None, maxstep=0.2)
-    if name == "LBFGS":
-        return LBFGS(atoms_or_filter, logfile=None)
-    if name == "FIRE":
-        return FIRE(atoms_or_filter, logfile=None)
-    return BFGS(atoms_or_filter, logfile=None, maxstep=0.2)
-
-
-def relax_tab(pmg_obj, model_family: str, variant: str):
-    st.subheader("Structure Optimization")
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        fmax = st.number_input(
-            "Force convergence (eV/Å)",
-            value=0.05, min_value=0.001, max_value=1.0,
-            step=0.01, format="%.3f", key="relax_fmax"
-        )
-    with c2:
-        max_steps = st.number_input(
-            "Max steps",
-            value=200, min_value=10, max_value=5000,
-            step=10, key="relax_maxsteps"
-        )
-    with c3:
-        optimizer = st.selectbox(
-            "Optimizer", ["BFGS", "LBFGS", "FIRE"], index=0, key="relax_opt"
-        )
-
-    mode = st.selectbox(
-        "Optimization mode",
-        ["Positions only", "Variable cell (shape + volume)", "Cell shape only (approx. fixed volume)"],
-        index=0, key="relax_mode"
-    )
-
-    save_xyz = st.checkbox("Stream trajectory to XYZ", value=False, key="relax_savexyz")
-    stride = st.number_input(
-        "Save every Nth step", value=10, min_value=1, max_value=1000,
-        step=1, key="relax_stride"
-    )
-
-    if pmg_obj is None:
-        st.info("Upload a structure to optimize.")
-        return
-
-    if isinstance(pmg_obj, Structure):
-        st.caption("Initial lattice: " + _lattice_summary(pmg_obj))
-
-    # keep downloads visible between runs
-    if st.session_state.relaxed_cif:
-        st.download_button(
-            "⬇️ Download relaxed CIF", st.session_state.relaxed_cif,
-            "relaxed_structure.cif", key="relax_dl_cif"
-        )
-    if st.session_state.relax_traj_xyz:
-        st.download_button(
-            "⬇️ Download trajectory (XYZ)", st.session_state.relax_traj_xyz,
-            "relax_trajectory.xyz", key="relax_dl_xyz"
-        )
-
-    if not st.button("Run optimization", type="primary", key="relax_run"):
-        return
-
+# ---------------- Helper: safe import wrapper ----------------
+def _safe_import(module_name: str):
+    """
+    Import a module lazily and return (module, error_str_or_None).
+    Never raises; on failure returns (None, traceback_str).
+    """
     try:
-        st.session_state.stop_requested = False
+        return importlib.import_module(module_name), None
+    except Exception as exc:
+        tb = "".join(traceback.format_exception(exc))
+        return None, tb
 
-        # Build ASE atoms and attach the chosen calculator (CHGNet or MACE)
-        atoms = atoms_from(pmg_obj)
-        atoms.calc = get_calculator(model_family, variant)
+# ---------------- Try to import lightweight struct helpers ----------------
+parse_uploaded_structure = None
+lattice_caption = None
+_core_struct, err_struct = _safe_import("core.struct")
+if _core_struct:
+    parse_uploaded_structure = getattr(_core_struct, "parse_uploaded_structure", None)
+    lattice_caption = getattr(_core_struct, "lattice_caption", None)
 
-        # Select target object depending on optimization mode
-        target = atoms
-        if mode == "Variable cell (shape + volume)":
-            target = UnitCellFilter(atoms)  # relax cell + positions
-        elif mode == "Cell shape only (approx. fixed volume)":
-            # shear-only strain filter (keeps lengths roughly constant)
-            target = StrainFilter(atoms, mask=[0, 0, 0, 1, 1, 1])
+# ---------------- Sidebar ----------------
+with st.sidebar:
+    st.header("Inputs")
 
-        progress = st.progress(0, text="Starting optimization…")
-        pct_label = st.empty()
-        energies = []
-        buf_xyz = io.StringIO() if save_xyz else None
-        step_counter = {"i": 0}
+    uploaded = st.file_uploader(
+        "Upload crystal (POSCAR/CONTCAR/CIF/XYZ)",
+        type=["cif", "POSCAR", "CONTCAR", "xyz", "poscar", "contcar"],
+        accept_multiple_files=False,
+        key="sb_upload",
+    )
 
-        def on_step():
-            if st.session_state.stop_requested:
-                raise RuntimeError("Stop requested by user.")
-            step_counter["i"] += 1
-            i = step_counter["i"]
-            e = atoms.get_potential_energy()
-            energies.append(float(e))
-            pct = min(int(100 * i / max_steps), 99)
-            progress.progress(pct, text=f"Optimizing… {pct}%")
-            pct_label.write(f"**Progress:** {pct}%")
-            if buf_xyz is not None and (i % int(st.session_state.get("relax_stride", 10)) == 0):
-                frame = atoms.copy()
-                ase_write(buf_xyz, frame, format="xyz")
+    st.subheader("Potential family")
+    model_family = st.radio(
+        "Select family", ["CHGNet", "MACE"], index=0, key="sb_family", horizontal=True
+    )
 
-        dyn = _make_optimizer(optimizer, target)
-        dyn.attach(on_step, interval=1)
-        dyn.run(fmax=float(fmax), steps=int(max_steps))
-
-        final_e = atoms.get_potential_energy()
-        fmax_val = float(np.abs(atoms.get_forces()).max())
-        progress.progress(100, text="Done")
-        pct_label.write("**Progress:** 100%")
-
-        final_struct = AseAtomsAdaptor.get_structure(atoms)
-        if isinstance(pmg_obj, Structure):
-            st.write("**Final lattice:** " + _lattice_summary(final_struct))
-        st.success(f"Relaxed: E = {final_e:.6f} eV | max|F| = {fmax_val:.4f} eV/Å")
-
-        png = _plot_energy(energies)
-        if png:
-            st.image(png, caption="Energy vs optimization step", use_container_width=False)
-
-        # Persist downloads so buttons don’t disappear
-        st.session_state.relaxed_cif = final_struct.to(fmt="cif").encode()
-        st.download_button(
-            "⬇️ Download relaxed CIF", st.session_state.relaxed_cif,
-            file_name="relaxed_structure.cif", key="relax_dl_cif2"
+    if model_family == "CHGNet":
+        variant = st.selectbox(
+            "CHGNet model",
+            ["CHGNet v0.4 (default)", "CHGNet (metals)", "CHGNet (oxides)"],
+            index=0, key="sb_variant",
+        )
+    else:
+        variant = st.selectbox(
+            "MACE model",
+            ["Auto (mace-models default)", "MACE-MP (small)", "MACE-MP (medium)", "MACE-OFF23 (medium)"],
+            index=0, key="sb_variant",
         )
 
-        if buf_xyz is not None:
-            st.session_state.relax_traj_xyz = buf_xyz.getvalue().encode()
-            st.download_button(
-                "⬇️ Download trajectory (XYZ)", st.session_state.relax_traj_xyz,
-                file_name="relax_trajectory.xyz", key="relax_dl_xyz2"
-            )
+    st.divider()
+    low_mem = st.checkbox("Low-memory mode (recommended on Streamlit Cloud)", value=True, key="sb_lowmem")
 
-    except Exception as exc:
-        st.error(f"Optimization failed: {exc}")
-        with st.expander("Traceback"):
+    st.subheader("Controls")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("🛑 Stop", use_container_width=True, key="sb_stop"):
+            st.session_state.stop_requested = True
+            st.toast("Stop requested.", icon="🛑")
+    with c2:
+        if st.button("🧹 Clear cache", use_container_width=True, key="sb_clear"):
+            try:
+                st.cache_data.clear()
+                st.cache_resource.clear()
+            except Exception:
+                pass
+            st.session_state.stop_requested = False
+            st.session_state.relaxed_cif = None
+            st.session_state.relax_traj_xyz = None
+            # cleanup temp files created by tabs
+            for p in st.session_state.tmp_paths:
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+            st.session_state.tmp_paths = []
+            st.success("Cleared caches & temp files.")
+
+# ---------------- Diagnostics panel ----------------
+with st.expander("🔎 Diagnostics", expanded=False):
+    st.write("If a tab shows an error, expand it to see the traceback. "
+             "Cloud logs (Manage app → Cloud logs) will also show details.")
+    if err_struct:
+        st.warning("`core.struct` failed to import; viewer/parse may be limited.")
+        st.code(err_struct)
+
+# ---------------- Parse uploaded structure (if helper available) ----------------
+pmg_obj = None
+parse_msg = None
+if parse_uploaded_structure:
+    pmg_obj, parse_msg = parse_uploaded_structure(uploaded)
+else:
+    if uploaded:
+        st.warning("Structure parser not available (`core.struct` import failed).")
+
+if parse_msg:
+    st.info(parse_msg)
+if lattice_caption and pmg_obj is not None:
+    st.caption(lattice_caption(pmg_obj))
+
+# ---------------- Tabs (imports happen lazily inside each block) ----------------
+tab_about, tab_view, tab_relax, tab_elastic, tab_phonon, tab_md = st.tabs(
+    ["💡 About", "👁️ Viewer", "🧰 Structure Optimization", "🧱 Elastic Properties", "🎼 Phonons", "🌡️ MD"]
+)
+
+with tab_about:
+    mod, err = _safe_import("tabs.about_tab")
+    if err:
+        st.error("Failed to load About tab."); st.code(err)
+    else:
+        try:
+            mod.about_tab()
+        except Exception as exc:
+            st.error("Error running About tab.")
+            st.code("".join(traceback.format_exception(exc)))
+
+with tab_view:
+    mod, err = _safe_import("tabs.viewer_tab")
+    if err:
+        st.error("Failed to load Viewer tab."); st.code(err)
+    else:
+        try:
+            mod.viewer_tab(pmg_obj)
+        except Exception as exc:
+            st.error("Error running Viewer tab.")
+            st.code("".join(traceback.format_exception(exc)))
+
+with tab_relax:
+    mod, err = _safe_import("tabs.relax_tab")
+    if err:
+        st.error("Failed to load Structure Optimization tab."); st.code(err)
+    else:
+        try:
+            mod.relax_tab(pmg_obj, model_family, variant, low_mem)
+        except Exception as exc:
+            st.error("Error running Structure Optimization tab.")
+            st.code("".join(traceback.format_exception(exc)))
+
+with tab_elastic:
+    mod, err = _safe_import("tabs.elastic_tab")
+    if err:
+        st.error("Failed to load Elastic Properties tab."); st.code(err)
+    else:
+        try:
+            mod.elastic_tab(pmg_obj, model_family, low_mem)
+        except Exception as exc:
+            st.error("Error running Elastic Properties tab.")
+            st.code("".join(traceback.format_exception(exc)))
+
+with tab_phonon:
+    mod, err = _safe_import("tabs.phonon_tab")
+    if err:
+        st.error("Failed to load Phonons tab."); st.code(err)
+    else:
+        try:
+            mod.phonon_tab(pmg_obj, model_family, low_mem)
+        except Exception as exc:
+            st.error("Error running Phonons tab.")
+            st.code("".join(traceback.format_exception(exc)))
+
+with tab_md:
+    mod, err = _safe_import("tabs.md_tab")
+    if err:
+        st.error("Failed to load MD tab."); st.code(err)
+    else:
+        try:
+            mod.md_tab(pmg_obj, model_family, variant)
+        except Exception as exc:
+            st.error("Error running MD tab.")
             st.code("".join(traceback.format_exception(exc)))
