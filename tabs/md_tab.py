@@ -1,6 +1,9 @@
 # tabs/md_tab.py
 from __future__ import annotations
-import io, os, tempfile, traceback, numpy as np, streamlit as st
+import io, os, tempfile, traceback
+import numpy as np
+import streamlit as st
+
 from ase import units
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from ase.md.verlet import VelocityVerlet
@@ -9,57 +12,85 @@ try:
     from ase.md.nptberendsen import NPTBerendsen
 except Exception:
     NPTBerendsen = None
+
 from ase.io import write as ase_write, read as ase_read
 from pymatgen.io.ase import AseAtomsAdaptor
+
 from core.struct import atoms_from
 from core.model import get_calculator
-import matplotlib; matplotlib.use("Agg")
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib.ticker import ScalarFormatter
 
-# session keys
+# ---- Session keys for persisted artifacts (so they don't vanish after downloads) ----
 _MSD_PLOT_KEY = "md_msd_png"
-_MD_LAST_CIF = "md_last_cif"
-_MD_XYZ = "md_traj_xyz"
-_MD_GIF = "md_traj_gif"
+_MD_LAST_CIF  = "md_last_cif"
+_MD_XYZ       = "md_traj_xyz"
+_MD_GIF       = "md_traj_gif"
 
+def _ensure_tmp_list():
+    if "tmp_paths" not in st.session_state:
+        st.session_state.tmp_paths = []
+
+# ---- Online MSD helpers ----
 def _online_msd_state(): return {"r0": None, "msd": []}
+
 def _online_msd_update(state, r: np.ndarray):
     if state["r0"] is None:
-        state["r0"] = r.copy(); state["msd"].append(0.0); return
-    dr = r - state["r0"]; state["msd"].append(float((dr * dr).sum(axis=1).mean()))
+        state["r0"] = r.copy()
+        state["msd"].append(0.0)
+        return
+    dr = r - state["r0"]
+    state["msd"].append(float((dr * dr).sum(axis=1).mean()))
 
 def _plot_msd(msd_vals, dt_fs: float) -> bytes | None:
-    if not msd_vals: return None
+    if not msd_vals:
+        return None
     plt.rcParams.update({"font.size": 18})
     fig = plt.figure(figsize=(5.0, 3.6))
     ax = plt.gca()
-    sf = ScalarFormatter(useMathText=False); sf.set_scientific(False); sf.set_useOffset(False)
+    sf = ScalarFormatter(useMathText=False)
+    sf.set_scientific(False)
+    sf.set_useOffset(False)
     ax.yaxis.set_major_formatter(sf)
     t_ps = np.arange(len(msd_vals)) * float(dt_fs) / 1000.0
     ax.plot(t_ps, msd_vals, linewidth=2)
-    ax.set_xlabel("Time (ps)"); ax.set_ylabel("MSD (Å$^2$)"); ax.set_title("Mean Squared Displacement")
-    buf = io.BytesIO(); fig.savefig(buf, dpi=160, bbox_inches="tight"); plt.close(fig)
-    buf.seek(0); return buf.read()
+    ax.set_xlabel("Time (ps)")
+    ax.set_ylabel("MSD (Å$^2$)")
+    ax.set_title("Mean Squared Displacement")
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
 
 def _make_traj_gif(xyz_path: str, forced_symbols: str | None = None) -> tuple[bytes, int]:
-    """Return (gif_bytes, n_frames)."""
+    """Build an animated GIF from an XYZ trajectory. Returns (gif_bytes, n_frames)."""
     try:
-        atoms_list = ase_read(xyz_path, index=":")  # loads frames; keep system modest on Cloud
+        atoms_list = ase_read(xyz_path, index=":")  # loads all frames
         if forced_symbols:
-            for a in atoms_list: a.set_chemical_symbols(forced_symbols)
+            for a in atoms_list:
+                a.set_chemical_symbols(forced_symbols)
         n = len(atoms_list)
         if n < 2:
             return b"", n
+
         fig, ax = plt.subplots(figsize=(4, 4))
+        from ase.visualize.plot import plot_atoms
+
         def update(i):
             ax.clear()
-            from ase.visualize.plot import plot_atoms
             plot_atoms(atoms_list[i], ax, radii=0.8, rotation=("45x,45y,0z"))
-            ax.set_title(f"Frame {i + 1}"); ax.axis("off")
+            ax.set_title(f"Frame {i + 1}")
+            ax.axis("off")
+
         ani = FuncAnimation(fig, update, frames=n, interval=200)
-        buf = io.BytesIO(); ani.save(buf, writer="pillow", dpi=200, fps=60); plt.close(fig)
+        buf = io.BytesIO()
+        ani.save(buf, writer="pillow", dpi=200, fps=60)
+        plt.close(fig)
         buf.seek(0)
         return buf.read(), n
     except Exception:
@@ -67,8 +98,9 @@ def _make_traj_gif(xyz_path: str, forced_symbols: str | None = None) -> tuple[by
 
 def md_tab(pmg_obj, model_family: str, variant: str):
     st.subheader("Molecular Dynamics")
+    _ensure_tmp_list()
 
-    # show persisted artifacts first (so they don't disappear after downloads)
+    # ---- Persisted artifacts (remain visible across reruns/downloads) ----
     if st.session_state.get(_MSD_PLOT_KEY):
         st.image(st.session_state[_MSD_PLOT_KEY], caption="MSD vs time", use_container_width=False)
     if st.session_state.get(_MD_GIF):
@@ -80,6 +112,7 @@ def md_tab(pmg_obj, model_family: str, variant: str):
         st.download_button("⬇️ Download trajectory (XYZ)", st.session_state[_MD_XYZ],
                            "md_trajectory.xyz", key="md_dl_xyz_persist")
 
+    # ---- Controls ----
     c0, c00 = st.columns([1, 1])
     with c0:
         ensemble = st.selectbox("Ensemble", ["NVE", "NVT (Langevin)", "NPT (Berendsen)"], key="md_ensemble")
@@ -109,82 +142,102 @@ def md_tab(pmg_obj, model_family: str, variant: str):
     with c5:
         stride = st.number_input("Save every Nth step", value=25, min_value=1, max_value=1000, step=1, key="md_stride")
     with c6:
-        # Render GIF only if XYZ streaming is enabled
         make_gif = st.checkbox("Render GIF animation", value=False, key="md_makegif", disabled=not save_xyz)
         if not save_xyz:
             st.caption("Enable “Stream trajectory to XYZ” to render an animation.")
 
     if pmg_obj is None:
-        st.info("Upload a structure to run MD."); return
-    if not st.button("Run MD", type="primary", key="md_run"): return
+        st.info("Upload a structure to run MD.")
+        return
+
+    if not st.button("Run MD", type="primary", key="md_run"):
+        return
 
     try:
         st.session_state.stop_requested = False
+
+        # ---- Build atoms + calculator ----
         atoms = atoms_from(pmg_obj)
         atoms.calc = get_calculator(model_family, variant)
 
+        # ---- Initialize velocities ----
         MaxwellBoltzmannDistribution(atoms, temperature_K=float(T_init))
 
+        # ---- Choose integrator ----
         dt = float(dt_fs) * units.fs
         if ensemble.startswith("NVE"):
             dyn = VelocityVerlet(atoms, dt)
         elif ensemble.startswith("NVT"):
-            gamma_fs = float(friction) / 1000.0
+            gamma_fs = float(friction) / 1000.0  # 1/ps -> 1/fs
             dyn = Langevin(atoms, timestep=dt, temperature_K=float(T_target), friction=gamma_fs)
         else:
             if NPTBerendsen is None:
-                st.error("NPT not available. Choose NVE or NVT."); return
-            p_target = float(pressure_bar) * 1e5
-            dyn = NPTBerendsen(atoms, timestep=dt, temperature_K=float(T_target),
-                               taut=100.0 * units.fs, pressure=p_target, compressibility=4.5e-10)
+                st.error("NPT not available. Choose NVE or NVT.")
+                return
+            p_target = float(pressure_bar) * 1e5  # bar -> Pa
+            dyn = NPTBerendsen(
+                atoms, timestep=dt, temperature_K=float(T_target),
+                taut=100.0 * units.fs, pressure=p_target, compressibility=4.5e-10
+            )
 
+        # ---- Progress + MSD state ----
         progress = st.progress(0, text="Starting MD…")
         pct_label = st.empty()
         msd_state = _online_msd_state()
 
-        tmp_path, xyz_file = (None, None)
+        # ---- Trajectory file (write an initial frame, then append each stride) ----
+        tmp_path = None
         if save_xyz:
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xyz")
-            tmp_path = tmp.name; tmp.close()
+            tmp_path = tmp.name
+            tmp.close()
             st.session_state.tmp_paths.append(tmp_path)
-            xyz_file = open(tmp_path, "w")
+            # Initial frame ensures ≥1 frame even before stepping
+            ase_write(tmp_path, atoms, format="xyz", append=False)
 
+        # ---- Callback each MD step ----
         step_idx = {"i": 0}
         def on_step():
             if st.session_state.stop_requested:
                 raise RuntimeError("Stop requested by user.")
-            step_idx["i"] += 1; i = step_idx["i"]
-            pos = atoms.get_positions(); _online_msd_update(msd_state, pos)
+            step_idx["i"] += 1
+            i = step_idx["i"]
+
+            pos = atoms.get_positions()
+            _online_msd_update(msd_state, pos)
+
             if save_xyz and (i % int(st.session_state.get("md_stride", 25)) == 0):
-                s = io.StringIO(); ase_write(s, atoms.copy(), format="xyz"); xyz_file.write(s.getvalue())
+                # Append a properly formatted XYZ frame (ASE handles headers/splits)
+                ase_write(tmp_path, atoms, format="xyz", append=True)
+
             pct = min(int(100 * i / steps), 99)
-            progress.progress(pct, text=f"MD running… {pct}%"); pct_label.write(f"**Progress:** {pct}%")
+            progress.progress(pct, text=f"MD running… {pct}%")
+            pct_label.write(f"**Progress:** {pct}%")
 
         dyn.attach(on_step, interval=1)
+
+        # ---- Run MD ----
         dyn.run(int(steps))
 
-        if xyz_file is not None:
-            xyz_file.flush(); xyz_file.close()
+        progress.progress(100, text="Done")
+        pct_label.write("**Progress:** 100%")
 
-        progress.progress(100, text="Done"); pct_label.write("**Progress:** 100%")
-
-        # Persist MSD plot
+        # ---- Persist MSD plot ----
         st.session_state[_MSD_PLOT_KEY] = _plot_msd(msd_state["msd"], float(dt_fs))
         if st.session_state[_MSD_PLOT_KEY]:
             st.image(st.session_state[_MSD_PLOT_KEY], caption="MSD vs time", use_container_width=False)
 
-        # Persist final frame
+        # ---- Persist last frame (CIF) ----
         final_struct = AseAtomsAdaptor.get_structure(atoms)
         st.session_state[_MD_LAST_CIF] = final_struct.to(fmt="cif").encode()
         st.download_button("⬇️ Download last frame (CIF)", st.session_state[_MD_LAST_CIF],
                            file_name="md_last_frame.cif", key="md_dl_cif")
 
-        # Handle trajectory artifacts
+        # ---- Handle trajectory artifacts (XYZ + optional GIF) ----
         if tmp_path:
             with open(tmp_path, "rb") as fh:
-                data = fh.read()
-            st.session_state[_MD_XYZ] = data
-            st.download_button("⬇️ Download trajectory (XYZ, streamed)", st.session_state[_MD_XYZ],
+                st.session_state[_MD_XYZ] = fh.read()
+            st.download_button("⬇️ Download trajectory (XYZ)", st.session_state[_MD_XYZ],
                                file_name="md_trajectory.xyz", key="md_dl_xyz")
 
             if make_gif:
@@ -193,7 +246,8 @@ def md_tab(pmg_obj, model_family: str, variant: str):
                     st.info("No frames to animate. Increase MD steps or lower the 'Save every Nth step' value.")
                 elif gif_bytes:
                     st.session_state[_MD_GIF] = gif_bytes
-                    st.image(st.session_state[_MD_GIF], caption=f"Trajectory animation (GIF) — {n_frames} frames",
+                    st.image(st.session_state[_MD_GIF],
+                             caption=f"Trajectory animation (GIF) — {n_frames} frames",
                              use_container_width=False)
                     st.download_button("⬇️ Download GIF", st.session_state[_MD_GIF],
                                        file_name="md_trajectory.gif", key="md_dl_gif")
