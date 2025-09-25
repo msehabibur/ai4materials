@@ -6,37 +6,29 @@ import streamlit as st
 def _lazy_import():
     try:
         from atomate2.forcefields.flows.phonons import PhononMaker
-        from atomate2.forcefields.flows.elastic import ElasticMaker  # not used here but confirms package
-        # Detect relax makers
-        try:
-            from atomate2.forcefields.jobs import MACERelaxMaker as _MACERelaxMaker
-        except Exception:
-            _MACERelaxMaker = None
-        try:
-            from atomate2.forcefields.jobs import CHGNetRelaxMaker as _CHGNetRelaxMaker
-        except Exception:
-            _CHGNetRelaxMaker = None
-
         from jobflow import run_locally, SETTINGS
-        return PhononMaker, _MACERelaxMaker, _CHGNetRelaxMaker, run_locally, SETTINGS, None
+        return PhononMaker, run_locally, SETTINGS, None
     except Exception as exc:
-        return None, None, None, None, None, exc
+        return None, None, None, exc
 
 def phonon_tab(pmg_obj, model_family: str, low_mem: bool):
     st.subheader("Phonons")
 
-    PhononMaker, MACERelaxMaker, CHGNetRelaxMaker, run_locally, SETTINGS, err = _lazy_import()
+    PhononMaker, run_locally, SETTINGS, err = _lazy_import()
     if err:
         st.error("Dependencies missing. Ensure: atomate2[phonons,forcefields], jobflow, phonopy, spglib.")
         st.code(str(err)); return
 
-    # Low-memory defaults
+    # Memory-lean defaults
     default_min_len = 10.0 if low_mem else 12.0
     default_store_fc = False
 
     col1, col2 = st.columns(2)
     with col1:
-        min_len = st.number_input("Supercell min length (Å)", value=default_min_len, min_value=8.0, max_value=25.0, step=0.5, key="ph_minlen")
+        # ↑ allow very large cap so you aren't blocked
+        min_len = st.number_input("Supercell min length (Å)",
+                                  value=default_min_len, min_value=1.0, max_value=1000.0,
+                                  step=0.5, key="ph_minlen")
     with col2:
         store_fc = st.checkbox("Store force constants (higher RAM)", value=default_store_fc, key="ph_storefc")
 
@@ -47,22 +39,10 @@ def phonon_tab(pmg_obj, model_family: str, low_mem: bool):
     pct_label = st.empty()
 
     try:
-        relax_maker = None
-        fam = (model_family or "CHGNet").strip().lower()
-        if fam == "mace" and MACERelaxMaker is not None:
-            relax_maker = MACERelaxMaker(relax_cell=False)  # phonon deformations usually keep cell fixed
-        elif fam == "chgnet" and CHGNetRelaxMaker is not None:
-            relax_maker = CHGNetRelaxMaker(relax_cell=False)
-        else:
-            # fallback: let PhononMaker use its internal default relaxer
-            pass
-
         progress.progress(10, text="Preparing flow…"); pct_label.write("**Progress:** 10%")
-        if relax_maker is not None:
-            flow = PhononMaker(min_length=float(min_len), store_force_constants=bool(store_fc),
-                               relax_maker=relax_maker).make(structure=pmg_obj)
-        else:
-            flow = PhononMaker(min_length=float(min_len), store_force_constants=bool(store_fc)).make(structure=pmg_obj)
+
+        # IMPORTANT: atomate2==0.0.14 PhononMaker has NO relax_maker kwarg
+        flow = PhononMaker(min_length=float(min_len), store_force_constants=bool(store_fc)).make(structure=pmg_obj)
 
         progress.progress(30, text="Running jobs…"); pct_label.write("**Progress:** 30%")
         _ = run_locally(flow, create_folders=True)
@@ -76,8 +56,6 @@ def phonon_tab(pmg_obj, model_family: str, low_mem: bool):
             load=True,
             sort={"completed_at": -1},
         )
-
-        progress.progress(90, text="Rendering plots…"); pct_label.write("**Progress:** 90%")
         if not result:
             progress.progress(100, text="Done (no results)"); pct_label.write("**Progress:** 100%")
             st.warning("No phonon results found."); return
@@ -91,6 +69,8 @@ def phonon_tab(pmg_obj, model_family: str, low_mem: bool):
         ph_bs = PhononBandStructureSymmLine.from_dict(result['output']['phonon_bandstructure'])
         ph_dos = PhononDos.from_dict(result['output']['phonon_dos'])
         del result; gc.collect()
+
+        progress.progress(90, text="Rendering plots…"); pct_label.write("**Progress:** 90%")
 
         # DOS
         plt.rcParams.update({"font.size": 16})
