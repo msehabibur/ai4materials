@@ -93,6 +93,6 @@ atomate2[forcefields]
 jobflow
 
 # remove unused heavy extras (delete these three from your file if present):
-# torchmetrics
-# torchdata==0.7.1
-# pytorch-lightning==2.5.0.post0
+torchmetrics
+torchdata==0.7.1
+pytorch-lightning==2.5.0.post0
