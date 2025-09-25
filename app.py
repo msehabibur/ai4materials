@@ -1,186 +1,68 @@
-# app.py (SAFE BOOT VERSION)
+# app.py
 from __future__ import annotations
-import os
-import importlib
-import traceback
 import streamlit as st
+from pymatgen.core import Structure
 
-# --- Page setup early so UI renders even if later imports fail ---
-st.set_page_config(page_title="Materials Studio", layout="wide")
-st.title("🧪 Materials Studio")
+from tabs.viewer_tab import viewer_tab
+from tabs.relax_tab import relax_tab
+from tabs.md_tab import md_tab
+from tabs.phonon_tab import phonon_tab
+from tabs.leaderboard_tab import leaderboard_tab
 
-# ---------------- Session state defaults ----------------
-st.session_state.setdefault("stop_requested", False)
-st.session_state.setdefault("tmp_paths", [])
-st.session_state.setdefault("relaxed_cif", None)
-st.session_state.setdefault("relax_traj_xyz", None)
+st.set_page_config(page_title="Materials Studio — MACE", page_icon="🧪", layout="wide")
 
-# ---------------- Helper: safe import wrapper ----------------
-def _safe_import(module_name: str):
-    """
-    Import a module lazily and return (module, error_str_or_None).
-    Never raises; on failure returns (None, traceback_str).
-    """
-    try:
-        return importlib.import_module(module_name), None
-    except Exception as exc:
-        tb = "".join(traceback.format_exception(exc))
-        return None, tb
-
-# ---------------- Try to import lightweight struct helpers ----------------
-parse_uploaded_structure = None
-lattice_caption = None
-_core_struct, err_struct = _safe_import("core.struct")
-if _core_struct:
-    parse_uploaded_structure = getattr(_core_struct, "parse_uploaded_structure", None)
-    lattice_caption = getattr(_core_struct, "lattice_caption", None)
-
-# ---------------- Sidebar ----------------
-with st.sidebar:
-    st.header("Inputs")
-
-    uploaded = st.file_uploader(
-        "Upload crystal (POSCAR/CONTCAR/CIF/XYZ)",
-        type=["cif", "POSCAR", "CONTCAR", "xyz", "poscar", "contcar"],
-        accept_multiple_files=False,
-        key="sb_upload",
-    )
-
-    st.subheader("Potential family")
-    model_family = st.radio(
-        "Select family", ["CHGNet", "MACE"], index=0, key="sb_family", horizontal=True
-    )
-
-    if model_family == "CHGNet":
-        variant = st.selectbox(
-            "CHGNet model",
-            ["CHGNet v0.4 (default)", "CHGNet (metals)", "CHGNet (oxides)"],
-            index=0, key="sb_variant",
-        )
-    else:
-        variant = st.selectbox(
-            "MACE model",
-            ["Auto (mace-models default)", "MACE-MP (small)", "MACE-MP (medium)", "MACE-OFF23 (medium)"],
-            index=0, key="sb_variant",
-        )
-
-    st.divider()
-    low_mem = st.checkbox("Low-memory mode (recommended on Streamlit Cloud)", value=True, key="sb_lowmem")
-
-    st.subheader("Controls")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("🛑 Stop", use_container_width=True, key="sb_stop"):
-            st.session_state.stop_requested = True
-            st.toast("Stop requested.", icon="🛑")
-    with c2:
-        if st.button("🧹 Clear cache", use_container_width=True, key="sb_clear"):
+def _load_structure_from_sidebar() -> Structure | None:
+    with st.sidebar:
+        st.header("📁 Structure")
+        up = st.file_uploader("Upload CIF/POSCAR/XYZ", type=["cif", "poscar", "vasp", "xyz"], key="sb_upl")
+        pmg_obj = None
+        if up is not None:
             try:
-                st.cache_data.clear()
-                st.cache_resource.clear()
-            except Exception:
-                pass
-            st.session_state.stop_requested = False
-            st.session_state.relaxed_cif = None
-            st.session_state.relax_traj_xyz = None
-            # cleanup temp files created by tabs
-            for p in st.session_state.tmp_paths:
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
-            st.session_state.tmp_paths = []
-            st.success("Cleared caches & temp files.")
+                fmt = "cif"
+                name = (up.name or "").lower()
+                if name.endswith("poscar") or name == "poscar":
+                    fmt = "poscar"
+                elif name.endswith(".xyz"):
+                    fmt = "xyz"
+                content = up.getvalue().decode("utf-8", errors="ignore")
+                pmg_obj = Structure.from_str(content, fmt=fmt)
+                st.success(f"Loaded structure: {len(pmg_obj)} atoms")
+            except Exception as e:
+                st.error(f"Failed to parse structure: {e}")
+        return pmg_obj
 
-# ---------------- Diagnostics panel ----------------
-with st.expander("🔎 Diagnostics", expanded=False):
-    st.write("If a tab shows an error, expand it to see the traceback. "
-             "Cloud logs (Manage app → Cloud logs) will also show details.")
-    if err_struct:
-        st.warning("`core.struct` failed to import; viewer/parse may be limited.")
-        st.code(err_struct)
+def about_tab():
+    st.subheader("About this Tool")
+    st.markdown(
+        "This app uses **MACE** (Message Passing Atomic Cluster Expansion) as the default and only "
+        "Machine-Learned Force Field to run structure optimization, molecular dynamics, and phonons. "
+        "All CHGNet/M3GNet options have been removed to ensure a focused, consistent experience."
+    )
+    st.markdown(
+        "- **Viewer & Supercell:** Inspect and expand your crystal before simulations.\n"
+        "- **Structure Optimization:** Choose optimizer (FIRE/BFGS), force tolerance, and whether to relax the cell.\n"
+        "- **Molecular Dynamics:** Pick ensemble (NVE/NVT/NPT), temperatures, timestep, stride; download trajectories.\n"
+        "- **Phonons:** Run atomate2 force-field phonon workflow; plots scaled to a compact fixed space."
+    )
+    st.info("Tip: Keep systems moderate in size to stay within memory budgets; for large sweeps, use a backend queue/workers setup.")
 
-# ---------------- Parse uploaded structure (if helper available) ----------------
-pmg_obj = None
-parse_msg = None
-if parse_uploaded_structure:
-    pmg_obj, parse_msg = parse_uploaded_structure(uploaded)
-else:
-    if uploaded:
-        st.warning("Structure parser not available (`core.struct` import failed).")
+def main():
+    st.title("🧪 Materials Studio — MACE-only")
+    pmg_obj = _load_structure_from_sidebar()
 
-if parse_msg:
-    st.info(parse_msg)
-if lattice_caption and pmg_obj is not None:
-    st.caption(lattice_caption(pmg_obj))
+    tabs = st.tabs(["👁 Viewer", "🧰 Structure Optimization", "🏃 MD", "🎵 Phonons", "🏆 Leaderboard", "ℹ️ About"])
+    with tabs[0]:
+        viewer_tab(pmg_obj)
+    with tabs[1]:
+        relax_tab(pmg_obj)
+    with tabs[2]:
+        md_tab(pmg_obj)
+    with tabs[3]:
+        phonon_tab(pmg_obj)
+    with tabs[4]:
+        leaderboard_tab()
+    with tabs[5]:
+        about_tab()
 
-# ---------------- Tabs (imports happen lazily inside each block) ----------------
-tab_about, tab_view, tab_relax, tab_elastic, tab_phonon, tab_md = st.tabs(
-    ["💡 About", "👁️ Viewer", "🧰 Structure Optimization", "🧱 Elastic Properties", "🎼 Phonons", "🌡️ MD"]
-)
-
-with tab_about:
-    mod, err = _safe_import("tabs.about_tab")
-    if err:
-        st.error("Failed to load About tab."); st.code(err)
-    else:
-        try:
-            mod.about_tab()
-        except Exception as exc:
-            st.error("Error running About tab.")
-            st.code("".join(traceback.format_exception(exc)))
-
-with tab_view:
-    mod, err = _safe_import("tabs.viewer_tab")
-    if err:
-        st.error("Failed to load Viewer tab."); st.code(err)
-    else:
-        try:
-            mod.viewer_tab(pmg_obj)
-        except Exception as exc:
-            st.error("Error running Viewer tab.")
-            st.code("".join(traceback.format_exception(exc)))
-
-with tab_relax:
-    mod, err = _safe_import("tabs.relax_tab")
-    if err:
-        st.error("Failed to load Structure Optimization tab."); st.code(err)
-    else:
-        try:
-            mod.relax_tab(pmg_obj, model_family, variant, low_mem)
-        except Exception as exc:
-            st.error("Error running Structure Optimization tab.")
-            st.code("".join(traceback.format_exception(exc)))
-
-with tab_elastic:
-    mod, err = _safe_import("tabs.elastic_tab")
-    if err:
-        st.error("Failed to load Elastic Properties tab."); st.code(err)
-    else:
-        try:
-            mod.elastic_tab(pmg_obj, model_family, low_mem)
-        except Exception as exc:
-            st.error("Error running Elastic Properties tab.")
-            st.code("".join(traceback.format_exception(exc)))
-
-with tab_phonon:
-    mod, err = _safe_import("tabs.phonon_tab")
-    if err:
-        st.error("Failed to load Phonons tab."); st.code(err)
-    else:
-        try:
-            mod.phonon_tab(pmg_obj, model_family, low_mem)
-        except Exception as exc:
-            st.error("Error running Phonons tab.")
-            st.code("".join(traceback.format_exception(exc)))
-
-with tab_md:
-    mod, err = _safe_import("tabs.md_tab")
-    if err:
-        st.error("Failed to load MD tab."); st.code(err)
-    else:
-        try:
-            mod.md_tab(pmg_obj, model_family, variant)
-        except Exception as exc:
-            st.error("Error running MD tab.")
-            st.code("".join(traceback.format_exception(exc)))
+if __name__ == "__main__":
+    main()
