@@ -1,32 +1,38 @@
 # tabs/phonon_tab.py
 from __future__ import annotations
-import io, csv, gc, traceback, time
+import io, csv, gc, traceback
 import streamlit as st
 
 def _lazy_import():
     try:
         from atomate2.forcefields.flows.phonons import PhononMaker
+        from atomate2.forcefields.flows.elastic import ElasticMaker  # not used here but confirms package
+        # Detect relax makers
+        try:
+            from atomate2.forcefields.jobs import MACERelaxMaker as _MACERelaxMaker
+        except Exception:
+            _MACERelaxMaker = None
+        try:
+            from atomate2.forcefields.jobs import CHGNetRelaxMaker as _CHGNetRelaxMaker
+        except Exception:
+            _CHGNetRelaxMaker = None
+
         from jobflow import run_locally, SETTINGS
-        return PhononMaker, run_locally, SETTINGS, None
+        return PhononMaker, _MACERelaxMaker, _CHGNetRelaxMaker, run_locally, SETTINGS, None
     except Exception as exc:
-        return None, None, None, exc
+        return None, None, None, None, None, exc
 
 def phonon_tab(pmg_obj, model_family: str, low_mem: bool):
     st.subheader("Phonons")
 
-    PhononMaker, run_locally, SETTINGS, err = _lazy_import()
+    PhononMaker, MACERelaxMaker, CHGNetRelaxMaker, run_locally, SETTINGS, err = _lazy_import()
     if err:
         st.error("Dependencies missing. Ensure: atomate2[phonons,forcefields], jobflow, phonopy, spglib.")
         st.code(str(err)); return
 
-    if model_family != "CHGNet":
-        st.info("Phonon flow uses Atomate2 force-field workflows which currently support CHGNet. "
-                "Switch family to CHGNet in the sidebar to enable this tab.")
-        return
-
     # Low-memory defaults
     default_min_len = 10.0 if low_mem else 12.0
-    default_store_fc = False  # storing force constants is memory heavy
+    default_store_fc = False
 
     col1, col2 = st.columns(2)
     with col1:
@@ -41,10 +47,24 @@ def phonon_tab(pmg_obj, model_family: str, low_mem: bool):
     pct_label = st.empty()
 
     try:
-        progress.progress(10, text="Preparing flow…"); pct_label.write("**Progress:** 10%")
-        flow = PhononMaker(min_length=float(min_len), store_force_constants=bool(store_fc)).make(structure=pmg_obj)
+        relax_maker = None
+        fam = (model_family or "CHGNet").strip().lower()
+        if fam == "mace" and MACERelaxMaker is not None:
+            relax_maker = MACERelaxMaker(relax_cell=False)  # phonon deformations usually keep cell fixed
+        elif fam == "chgnet" and CHGNetRelaxMaker is not None:
+            relax_maker = CHGNetRelaxMaker(relax_cell=False)
+        else:
+            # fallback: let PhononMaker use its internal default relaxer
+            pass
 
-        progress.progress(25, text="Submitting jobs…"); pct_label.write("**Progress:** 25%")
+        progress.progress(10, text="Preparing flow…"); pct_label.write("**Progress:** 10%")
+        if relax_maker is not None:
+            flow = PhononMaker(min_length=float(min_len), store_force_constants=bool(store_fc),
+                               relax_maker=relax_maker).make(structure=pmg_obj)
+        else:
+            flow = PhononMaker(min_length=float(min_len), store_force_constants=bool(store_fc)).make(structure=pmg_obj)
+
+        progress.progress(30, text="Running jobs…"); pct_label.write("**Progress:** 30%")
         _ = run_locally(flow, create_folders=True)
 
         progress.progress(80, text="Collecting results…"); pct_label.write("**Progress:** 80%")
@@ -88,7 +108,6 @@ def phonon_tab(pmg_obj, model_family: str, low_mem: bool):
         st.image(buf_bs.read(), caption="Phonon Band Structure", use_container_width=False); plt.close(fig_bs)
 
         # CSV exports
-        import csv
         dos_csv = io.StringIO(); w = csv.writer(dos_csv)
         w.writerow(["Frequency (THz)", "Total DOS"])
         for fval, dval in zip(ph_dos.frequencies, ph_dos.densities):
