@@ -4,24 +4,27 @@ import streamlit as st
 
 def _lazy_import():
     try:
+        # Use the concrete CHGNet maker (works in Atomate2 forcefields)
+        from atomate2.forcefields.jobs import CHGNetRelaxMaker
         from atomate2.forcefields.flows.elastic import ElasticMaker
-        from atomate2.forcefields.jobs import ForceFieldRelaxMaker
         from jobflow import run_locally, SETTINGS
-        return ElasticMaker, ForceFieldRelaxMaker, run_locally, SETTINGS, None
+        return CHGNetRelaxMaker, ElasticMaker, run_locally, SETTINGS, None
     except Exception as exc:
         return None, None, None, None, exc
 
 def elastic_tab(pmg_obj):
     st.subheader("Elastic Constants & Mechanical Stability (Atomate2)")
 
-    ElasticMaker, ForceFieldRelaxMaker, run_locally, SETTINGS, err = _lazy_import()
+    CHGNetRelaxMaker, ElasticMaker, run_locally, SETTINGS, err = _lazy_import()
     if err:
-        st.error("Atomate2/Jobflow not available. Add to requirements: `atomate2`, `jobflow`")
+        st.error("Atomate2/Jobflow not available. Ensure requirements include:")
+        st.code("atomate2[phonons,forcefields]==0.0.18\njobflow==0.1.16\nchgnet==0.4.0")
+        st.code(str(err))
         return
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        ff_name = st.selectbox("Force Field", ["M3GNet", "CHGNet"], index=0)
+        st.caption("Backend fixed to CHGNet (stable).")
     with col2:
         fmax = st.number_input("Relax fmax (eV/Å)", value=1e-4, min_value=1e-6, max_value=1e-2, step=1e-4, format="%.6f")
     with col3:
@@ -32,20 +35,12 @@ def elastic_tab(pmg_obj):
 
     try:
         flow = ElasticMaker(
-            bulk_relax_maker=ForceFieldRelaxMaker(
-                force_field_name=ff_name,
-                relax_cell=True,
-                relax_kwargs={"fmax": float(fmax)}
-            ),
-            elastic_relax_maker=ForceFieldRelaxMaker(
-                force_field_name=ff_name,
-                relax_cell=False,
-                relax_kwargs={"fmax": float(fmax)}
-            ),
+            bulk_relax_maker=CHGNetRelaxMaker(relax_cell=True,  relax_kwargs={"fmax": float(fmax)}),
+            elastic_relax_maker=CHGNetRelaxMaker(relax_cell=False, relax_kwargs={"fmax": float(fmax)}),
         ).make(structure=pmg_obj)
 
-        st.info("Running locally via jobflow…")
-        _ = run_locally(flow, create_folders=True)
+        st.info("Running elastic workflow locally…")
+        _ = run_locally(flow, create_folders=True, raise_immediately=True)
 
         store = SETTINGS.JOB_STORE
         store.connect()
@@ -66,7 +61,6 @@ def elastic_tab(pmg_obj):
         st.code(json.dumps(et.get("ieee_format", et), indent=2))
         st.code(json.dumps(dp, indent=2))
 
-        # free result holder
         del result, et, dp
         gc.collect()
 
