@@ -1,154 +1,119 @@
 # tabs/elastic_tab.py
 from __future__ import annotations
-import gc, traceback, numpy as np, streamlit as st
+import io, json, csv, traceback
+import numpy as np
+import streamlit as st
+from pymatgen.core import Structure
+from atomate2.forcefields.flows.elastic import ElasticMaker
+from atomate2.forcefields.jobs import MACERelaxMaker
+from jobflow import run_locally, SETTINGS
 
-def _lazy_import():
-    try:
-        from atomate2.forcefields.jobs import CHGNetRelaxMaker as _CHG
-    except Exception:
-        _CHG = None
-    try:
-        from atomate2.forcefields.jobs import MACERelaxMaker as _MACE
-    except Exception:
-        _MACE = None
-    try:
-        from atomate2.forcefields.flows.elastic import ElasticMaker
-        from jobflow import run_locally, SETTINGS
-        return _CHG, _MACE, ElasticMaker, run_locally, SETTINGS, None
-    except Exception as exc:
-        return None, None, None, None, None, exc
+_EL_JSON = "elastic_json_bytes"
+_EL_CSV  = "elastic_csv_bytes"
+_EL_LAST = "elastic_last_payload"
 
-# ----- Unit helpers -----
-def _to_gpa_value(x: float) -> float:
-    """Normalize a single modulus-like value to GPa based on magnitude."""
+def _to_gpa(x):
+    """Convert Pa→GPa if values look too large; pass through if already GPa."""
+    if x is None:
+        return None
+    # Works for dicts, lists, scalars
+    if isinstance(x, dict):
+        return {k: _to_gpa(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple, np.ndarray)):
+        arr = np.array(x, dtype=float)
+        # Heuristic: if any abs > 1e5, assume Pa→GPa
+        needs = np.any(np.abs(arr) > 1e5)
+        factor = 1e-9 if needs else 1.0
+        return (arr * factor).tolist()
+    # scalar
     v = float(x)
-    a = abs(v)
-    if a >= 1e9:   # likely Pa
-        return v / 1e9
-    if a >= 1e4:   # likely MPa
-        return v / 1e3
-    return v       # already GPa (or small)
+    factor = 1e-9 if abs(v) > 1e5 else 1.0
+    return v * factor
 
-def _tensor_to_gpa(C):
-    arr = np.array(C, dtype=float)
-    # infer scale from diagonal median
-    diag = np.abs(np.diag(arr)) if arr.ndim == 2 else np.abs(arr)
-    med = np.median(diag) if diag.size else 1.0
-    if med >= 1e9:   s = 1/1e9
-    elif med >= 1e4: s = 1/1e3
-    else:            s = 1.0
-    return arr * s
+def _calc_iso_from_kg(k_gpa: float, g_gpa: float):
+    """Return (E, nu) from isotropic K,G in GPa; handle edge cases."""
+    K = float(k_gpa); G = float(g_gpa)
+    denom = (3 * K + G)
+    if abs(denom) < 1e-8:
+        return None, None
+    E = 9 * K * G / denom
+    nu = (3 * K - 2 * G) / (2 * denom)
+    return E, nu
 
-def _pretty_tensor_GPa(C):
-    A = _tensor_to_gpa(C)
-    lines = ["Elastic tensor C_ij (GPa):"]
-    for row in A:
-        lines.append("  " + "  ".join(f"{v:10.3f}" for v in row))
-    return "\n".join(lines)
-
-def _normalize_props_to_gpa(props: dict) -> dict:
-    """Return copy of props with moduli in GPa, dimensionless untouched."""
-    if not props: return {}
-    out = {}
-    for k, v in props.items():
-        if v is None:
-            out[k] = None; continue
-        if k in ("homogeneous_poisson", "universal_anisotropy"):
-            out[k] = float(v)
-        else:
-            out[k] = _to_gpa_value(float(v))
-    return out
-
-def _backstop_recompute_E_nu(props_gpa: dict) -> dict:
-    """If E or nu look off/missing, recompute from VRH K,G in GPa."""
-    K = props_gpa.get("k_vrh")
-    G = props_gpa.get("g_vrh")
-    if isinstance(K, (int,float)) and isinstance(G, (int,float)) and (3*K + G) != 0:
-        E_calc = 9 * K * G / (3 * K + G)
-        nu_calc = (3 * K - 2 * G) / (2 * (3 * K + G))
-        # Only overwrite if missing or clearly absurd (e.g., >1e5 GPa)
-        E_old = props_gpa.get("y_mod")
-        if not isinstance(E_old, (int,float)) or abs(E_old) > 1e5:
-            props_gpa["y_mod"] = E_calc
-        nu_old = props_gpa.get("homogeneous_poisson")
-        if not isinstance(nu_old, (int,float)) or not (-1.0 < nu_old < 0.5):
-            props_gpa["homogeneous_poisson"] = nu_calc
-    return props_gpa
-
-def _pretty_moduli(props_gpa: dict) -> str:
-    fields = [
+def _pack_csv(c_ij_gpa, props):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Elastic tensor C_ij (GPa) 6x6"])
+    for row in c_ij_gpa:
+        w.writerow([f"{v:.3f}" for v in row])
+    w.writerow([])
+    w.writerow(["Property", "Value (GPa or –)"])
+    keys = [
         ("k_voigt", "Bulk K_V (GPa)"),
         ("k_reuss", "Bulk K_R (GPa)"),
-        ("k_vrh",  "Bulk K_VRH (GPa)"),
+        ("k_vrh",   "Bulk K_VRH (GPa)"),
         ("g_voigt", "Shear G_V (GPa)"),
         ("g_reuss", "Shear G_R (GPa)"),
-        ("g_vrh",  "Shear G_VRH (GPa)"),
-        ("y_mod",  "Young's modulus (GPa)"),
+        ("g_vrh",   "Shear G_VRH (GPa)"),
+        ("y_mod",   "Young's modulus (GPa)"),
         ("homogeneous_poisson", "Poisson ratio (–)"),
         ("universal_anisotropy", "Universal anisotropy (–)"),
     ]
-    lines, warn_negative = [], False
-    for key, label in fields:
-        val = props_gpa.get(key, None)
-        if val is None: continue
-        try:
-            v = float(val)
-            if "(GPa)" in label and v < 0: warn_negative = True
-            lines.append(f"{label}: {v:,.3f}")
-        except Exception:
-            lines.append(f"{label}: {val}")
-    if warn_negative:
-        lines += [
-            "",
-            "⚠️ One or more moduli are negative. This typically indicates mechanical instability,",
-            "   insufficient relaxation, or a poor fit. Re-optimize the structure and retry."
-        ]
-    return "\n".join(lines)
+    for k, label in keys:
+        val = props.get(k, None)
+        w.writerow([label, f"{val:.3f}" if isinstance(val, (int, float)) and val is not None else "—"])
+    return buf.getvalue().encode()
 
-def elastic_tab(pmg_obj, model_family: str, low_mem: bool):
-    st.subheader("Elastic Properties")
-    CHG, MACE, ElasticMaker, run_locally, SETTINGS, err = _lazy_import()
-    if err:
-        st.error("Dependencies missing. Ensure: atomate2[phonons,forcefields], jobflow, phonopy, spglib.")
-        st.code(str(err)); return
+def elastic_tab(pmg_obj: Structure | None):
+    st.subheader("Elastic Constants — MACE")
+    if pmg_obj is None:
+        st.info("Upload/select a structure in the Viewer to compute elastic constants.")
+        return
 
-    # allow very fine fmax
-    default_fmax = 0.000100 if low_mem else 0.000050
-    col1, col2 = st.columns(2)
-    with col1:
-        fmax = st.number_input("Relax fmax (eV/Å)",
-                               value=float(default_fmax), min_value=0.000001, max_value=0.01,
-                               step=0.000001, format="%.6f", key="el_fmax")
-    with col2:
-        run = st.button("Run elastic workflow", type="primary", disabled=(pmg_obj is None), key="el_run")
-    if not run: return
+    c1, c2 = st.columns(2)
+    with c1:
+        fmax = st.number_input(
+            "Force tolerance fmax (eV/Å)",
+            value=1e-5, min_value=1e-6, max_value=1e-2, step=1e-5, format="%.0e",
+            key="el_fmax",
+        )
+    with c2:
+        relax_cell = st.selectbox(
+            "Bulk relax allows cell change?",
+            ["Relax cell (recommended)", "Keep cell fixed"],
+            key="el_relax_cell",
+        ).startswith("Relax")
 
-    progress = st.progress(0, text="Preparing flow…")
-    pct_label = st.empty()
+    run_btn = st.button("Run Elastic Workflow", type="primary", key="el_run_btn")
+
+    # show previous results if available
+    if st.session_state.get(_EL_LAST):
+        last = st.session_state[_EL_LAST]
+        st.success("Showing previous elastic results.")
+        _render_results(last)
+
+    if not run_btn:
+        return
 
     try:
-        fam = (model_family or "CHGNet").strip().lower()
-        def _pick_relax_maker(relax_cell: bool):
-            if fam == "mace" and MACE is not None:
-                return MACE(relax_cell=relax_cell, relax_kwargs={"fmax": float(fmax)})
-            if fam == "chgnet" and CHG is not None:
-                return CHG(relax_cell=relax_cell, relax_kwargs={"fmax": float(fmax)})
-            if MACE is not None:
-                return MACE(relax_cell=relax_cell, relax_kwargs={"fmax": float(fmax)})
-            if CHG is not None:
-                return CHG(relax_cell=relax_cell, relax_kwargs={"fmax": float(fmax)})
-            return None  # let ElasticMaker decide
-
-        progress.progress(10, text="Preparing flow…"); pct_label.write("**Progress:** 10%")
+        progress = st.progress(0, text="Building workflow… 10%")
+        bulk_maker = MACERelaxMaker(
+            relax_cell=True,
+            relax_kwargs={"fmax": float(fmax)}
+        )
+        el_maker = MACERelaxMaker(
+            relax_cell=False if not relax_cell else True,  # if relax_cell False → keep fixed
+            relax_kwargs={"fmax": float(fmax)}
+        )
         flow = ElasticMaker(
-            bulk_relax_maker=_pick_relax_maker(relax_cell=True),
-            elastic_relax_maker=_pick_relax_maker(relax_cell=False),
+            bulk_relax_maker=bulk_maker,
+            elastic_relax_maker=el_maker,
         ).make(structure=pmg_obj)
 
-        progress.progress(30, text="Running deformations…"); pct_label.write("**Progress:** 30%")
+        progress.progress(20, text="Running locally… 20%")
         _ = run_locally(flow, create_folders=True)
 
-        progress.progress(85, text="Fitting elastic tensor…"); pct_label.write("**Progress:** 85%")
+        progress.progress(70, text="Querying results… 70%")
         store = SETTINGS.JOB_STORE
         store.connect()
         result = store.query_one(
@@ -157,29 +122,91 @@ def elastic_tab(pmg_obj, model_family: str, low_mem: bool):
             load=True,
             sort={"completed_at": -1},
         )
-
-        if not result:
-            progress.progress(100, text="Done (no results)"); pct_label.write("**Progress:** 100%")
-            st.warning("No results found."); return
+        if not result or "output" not in result:
+            raise RuntimeError("No elastic results found in store.")
 
         et = result["output"]["elastic_tensor"]
-        dp = result["output"]["derived_properties"]
+        derived = result["output"]["derived_properties"] or {}
 
-        # Tensor pretty print (GPa)
-        tensor_to_show = et.get("ieee_format", et)
-        st.code(_pretty_tensor_GPa(tensor_to_show))
+        # Normalize units to GPa
+        c_ij = et.get("ieee_format") or et.get("matrix")
+        c_ij_gpa = _to_gpa(c_ij)
+        props_gpa = _to_gpa(derived)
 
-        # Normalize properties to GPa, then backstop recompute E/nu
-        props_gpa = _normalize_props_to_gpa(dp or {})
-        props_gpa = _backstop_recompute_E_nu(props_gpa)
-        st.code(_pretty_moduli(props_gpa))
+        # If y_mod missing or seems off, recompute from VRH
+        K = props_gpa.get("k_vrh")
+        G = props_gpa.get("g_vrh")
+        if (props_gpa.get("y_mod") is None) and (K is not None) and (G is not None):
+            E, nu = _calc_iso_from_kg(K, G)
+            if E is not None:
+                props_gpa["y_mod"] = E
+            if nu is not None:
+                props_gpa["homogeneous_poisson"] = nu
 
-        del result, et, dp
-        gc.collect()
+        payload = {"c_ij_gpa": c_ij_gpa, "props_gpa": props_gpa}
+        st.session_state[_EL_LAST] = payload
 
-        progress.progress(100, text="Done"); pct_label.write("**Progress:** 100%")
+        # Downloads
+        st.session_state[_EL_JSON] = json.dumps(payload, indent=2).encode()
+        st.session_state[_EL_CSV] = _pack_csv(c_ij_gpa, props_gpa)
+
+        progress.progress(100, text="Done")
+        _render_results(payload)
 
     except Exception as exc:
-        st.error("Elastic workflow failed.")
+        st.error(f"Elastic workflow failed: {exc}")
         with st.expander("Traceback"):
             st.code("".join(traceback.format_exception(exc)))
+
+def _render_results(payload: dict):
+    c_ij = np.array(payload["c_ij_gpa"], dtype=float)
+    props = payload["props_gpa"]
+
+    st.markdown("**Elastic tensor C** (GPa, IEEE 6×6):")
+    st.dataframe(
+        np.array([[f"{v:.3f}" for v in row] for row in c_ij]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # Small, clear metric grid
+    k_v, k_r, k_vrh = props.get("k_voigt"), props.get("k_reuss"), props.get("k_vrh")
+    g_v, g_r, g_vrh = props.get("g_voigt"), props.get("g_reuss"), props.get("g_vrh")
+    y_mod = props.get("y_mod")
+    nu = props.get("homogeneous_poisson")
+    au = props.get("universal_anisotropy")
+
+    cols = st.columns(3)
+    cols[0].metric("Bulk K_V (GPa)", f"{k_v:.3f}" if k_v is not None else "—")
+    cols[1].metric("Bulk K_R (GPa)", f"{k_r:.3f}" if k_r is not None else "—")
+    cols[2].metric("Bulk K_VRH (GPa)", f"{k_vrh:.3f}" if k_vrh is not None else "—")
+
+    cols = st.columns(3)
+    cols[0].metric("Shear G_V (GPa)", f"{g_v:.3f}" if g_v is not None else "—")
+    cols[1].metric("Shear G_R (GPa)", f"{g_r:.3f}" if g_r is not None else "—")
+    cols[2].metric("Shear G_VRH (GPa)", f"{g_vrh:.3f}" if g_vrh is not None else "—")
+
+    cols = st.columns(3)
+    cols[0].metric("Young's E (GPa)", f"{y_mod:.3f}" if y_mod is not None else "—")
+    cols[1].metric("Poisson ν (–)", f"{nu:.3f}" if nu is not None else "—")
+    cols[2].metric("Anisotropy AU (–)", f"{au:.3f}" if au is not None else "—")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button("Download JSON", st.session_state.get(_EL_JSON, b"{}"), "elastic_results.json", key="el_dl_json")
+    with c2:
+        st.download_button("Download CSV", st.session_state.get(_EL_CSV, b""), "elastic_results.csv", key="el_dl_csv")
+
+    # If anything is negative in K/G/E, add a hint
+    negs = []
+    for lbl, v in [("K_VRH", k_vrh), ("G_VRH", g_vrh), ("E", y_mod)]:
+        if v is not None and v < 0:
+            negs.append(lbl)
+    if negs:
+        st.warning(
+            "Some moduli are **negative** ({}). This usually indicates mechanical instability at the sampled "
+            "strain / configuration, insufficient relaxation (increase accuracy / lower fmax), or unit issues. "
+            "Units have been normalized to GPa here; if negatives persist, the crystal may be mechanically unstable."
+            .format(", ".join(negs)),
+            icon="⚠️",
+        )
