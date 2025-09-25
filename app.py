@@ -10,7 +10,7 @@ from tabs.phonon_tab import phonon_tab
 from tabs.md_tab import md_tab
 
 st.set_page_config(page_title="Materials Studio", layout="wide")
-st.title("🧪 Materials Studio (CHGNet)")
+st.title("🧪 Materials Studio")
 
 # session state
 st.session_state.setdefault("stop_requested", False)
@@ -28,13 +28,29 @@ with st.sidebar:
         key="sb_upload",
     )
 
-    st.subheader("CHGNet model")
-    chgnet_variant = st.selectbox(
-        "Select model",
-        ["CHGNet v0.4 (default)"],  # hook for future variants
-        index=0,
-        key="sb_chgnet_variant",
+    st.subheader("Potential family")
+    model_family = st.radio(
+        "Select family", ["CHGNet", "MACE"], index=0, key="sb_family", horizontal=True
     )
+
+    # Family-specific variants
+    if model_family == "CHGNet":
+        variant = st.selectbox(
+            "CHGNet model",
+            ["CHGNet v0.4 (default)", "CHGNet (metals)", "CHGNet (oxides)"],
+            index=0, key="sb_variant"
+        )
+    else:
+        variant = st.selectbox(
+            "MACE model",
+            [
+                "Auto (mace-models default)",
+                "MACE-MP (small)",
+                "MACE-MP (medium)",
+                "MACE-OFF23 (medium)",
+            ],
+            index=0, key="sb_variant"
+        )
 
     st.divider()
     st.subheader("Controls")
@@ -77,13 +93,13 @@ with tab_view:
     viewer_tab(pmg_obj)
 
 with tab_relax:
-    relax_tab(pmg_obj, chgnet_variant)
+    relax_tab(pmg_obj, model_family, variant)
 
 with tab_elastic:
-    elastic_tab(pmg_obj)   # Atomate2 uses CHGNet internally
+    elastic_tab(pmg_obj)
 
 with tab_phonon:
     phonon_tab(pmg_obj)
 
 with tab_md:
-    md_tab(pmg_obj, chgnet_variant)
+    md_tab(pmg_obj, model_family, variant)
