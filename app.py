@@ -1,71 +1,83 @@
 from __future__ import annotations
-import os as _os
-
-# Keep single-threaded defaults & GraphBolt off (safe on Streamlit Cloud)
-_os.environ.setdefault("OMP_NUM_THREADS", "1")
-_os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-_os.environ.setdefault("MKL_NUM_THREADS", "1")
-_os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
-_os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-_os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-_os.environ.setdefault("TORCH_NUM_THREADS", "1")
-_os.environ.setdefault("DGL_LOAD_GRAPHBOLT", "0")
-
+import os, shutil, time
 import streamlit as st
-from core.model import list_models, load_potential
+
 from core.struct import parse_uploaded_structure, lattice_caption
+from tabs.about_tab import about_tab
 from tabs.viewer_tab import viewer_tab
 from tabs.relax_tab import relax_tab
 from tabs.elastic_tab import elastic_tab
 from tabs.phonon_tab import phonon_tab
 from tabs.md_tab import md_tab
 
-st.set_page_config(
-    page_title="M3GNet Suite",
-    layout="wide",
-)
+st.set_page_config(page_title="Materials Studio", layout="wide")
 
-st.title("🔬 M3GNet Suite")
+# Small UI theme touches (keep fonts normal; plots will set their own font size)
+st.title("🧪 Materials Studio")
 
-# ───────────────────────────────── Sidebar ─────────────────────────────────
+# Session state for stop/clear
+if "stop_requested" not in st.session_state:
+    st.session_state.stop_requested = False
+if "tmp_paths" not in st.session_state:
+    st.session_state.tmp_paths = []
+if "relaxed_cif" not in st.session_state:
+    st.session_state.relaxed_cif = None
+if "relax_traj_xyz" not in st.session_state:
+    st.session_state.relax_traj_xyz = None
+
+# Sidebar
 with st.sidebar:
     st.header("Inputs")
-
-    # Model dropdown only (no free-text path)
-    available = list_models()
-    default_model = available[0] if available else "M3GNet-MP-2018.6.1"
-    model_name = st.selectbox("Pretrained PES model", [default_model] + [m for m in available if m != default_model])
-
     uploaded = st.file_uploader(
         "Upload crystal (POSCAR/CONTCAR/CIF/XYZ)",
         type=["cif", "POSCAR", "CONTCAR", "xyz", "poscar", "contcar"],
         accept_multiple_files=False,
     )
+    st.caption("Backend: **CHGNet** (fixed)")
 
-# Load model (Potential)
-potential, pot_err = load_potential(model_name)
-if pot_err:
-    st.error(pot_err)
+    st.divider()
+    st.subheader("Controls")
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("🛑 Stop", use_container_width=True):
+            st.session_state.stop_requested = True
+            st.toast("Stop requested.", icon="🛑")
+    with colB:
+        if st.button("🧹 Clear cache", use_container_width=True):
+            try:
+                st.cache_data.clear()
+                st.cache_resource.clear()
+            except Exception:
+                pass
+            st.session_state.stop_requested = False
+            st.session_state.relaxed_cif = None
+            st.session_state.relax_traj_xyz = None
+            # clean any temp files we recorded
+            for p in st.session_state.tmp_paths:
+                try: os.remove(p)
+                except Exception: pass
+            st.session_state.tmp_paths = []
+            st.success("Cleared caches & temp files.")
 
-# Parse structure (default if nothing uploaded)
 pmg_obj, parse_msg = parse_uploaded_structure(uploaded)
 if parse_msg:
     st.info(parse_msg)
-
-# Top summary
 if pmg_obj is not None:
     st.caption(lattice_caption(pmg_obj))
 
-# ───────────────────────────────── Tabs ─────────────────────────────────
-tab_view, tab_relax, tab_elastic, tab_phonon, tab_md = st.tabs(
-    ["👁️ Viewer", "🔧 Energy Optimization", "🧱 Elastic & Mechanical", "🎼 Phonons", "🌡️ MD (NVT)"]
+# Tabs
+tab_about, tab_view, tab_relax, tab_elastic, tab_phonon, tab_md = st.tabs(
+    ["💡 About", "👁️ Viewer", "🧰 Structure Optimization", "🧱 Elastic Properties", "🎼 Phonons", "🌡️ MD"]
 )
+
+with tab_about:
+    about_tab()
 
 with tab_view:
     viewer_tab(pmg_obj)
 
 with tab_relax:
-    relax_tab(pmg_obj, potential)
+    relax_tab(pmg_obj)
 
 with tab_elastic:
     elastic_tab(pmg_obj)
@@ -74,4 +86,4 @@ with tab_phonon:
     phonon_tab(pmg_obj)
 
 with tab_md:
-    md_tab(pmg_obj, potential)
+    md_tab(pmg_obj)
