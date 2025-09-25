@@ -1,6 +1,5 @@
 from __future__ import annotations
-import os, shutil, time
-import streamlit as st
+import os, streamlit as st
 
 from core.struct import parse_uploaded_structure, lattice_caption
 from tabs.about_tab import about_tab
@@ -11,19 +10,13 @@ from tabs.phonon_tab import phonon_tab
 from tabs.md_tab import md_tab
 
 st.set_page_config(page_title="Materials Studio", layout="wide")
+st.title("🧪 Materials Studio (CHGNet)")
 
-# Small UI theme touches (keep fonts normal; plots will set their own font size)
-st.title("🧪 Materials Studio")
-
-# Session state for stop/clear
-if "stop_requested" not in st.session_state:
-    st.session_state.stop_requested = False
-if "tmp_paths" not in st.session_state:
-    st.session_state.tmp_paths = []
-if "relaxed_cif" not in st.session_state:
-    st.session_state.relaxed_cif = None
-if "relax_traj_xyz" not in st.session_state:
-    st.session_state.relax_traj_xyz = None
+# session state
+st.session_state.setdefault("stop_requested", False)
+st.session_state.setdefault("tmp_paths", [])
+st.session_state.setdefault("relaxed_cif", None)
+st.session_state.setdefault("relax_traj_xyz", None)
 
 # Sidebar
 with st.sidebar:
@@ -32,18 +25,26 @@ with st.sidebar:
         "Upload crystal (POSCAR/CONTCAR/CIF/XYZ)",
         type=["cif", "POSCAR", "CONTCAR", "xyz", "poscar", "contcar"],
         accept_multiple_files=False,
+        key="sb_upload",
     )
-    st.caption("Backend: **CHGNet** (fixed)")
+
+    st.subheader("CHGNet model")
+    chgnet_variant = st.selectbox(
+        "Select model",
+        ["CHGNet v0.4 (default)"],  # hook for future variants
+        index=0,
+        key="sb_chgnet_variant",
+    )
 
     st.divider()
     st.subheader("Controls")
-    colA, colB = st.columns(2)
-    with colA:
-        if st.button("🛑 Stop", use_container_width=True):
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("🛑 Stop", use_container_width=True, key="sb_stop"):
             st.session_state.stop_requested = True
             st.toast("Stop requested.", icon="🛑")
-    with colB:
-        if st.button("🧹 Clear cache", use_container_width=True):
+    with c2:
+        if st.button("🧹 Clear cache", use_container_width=True, key="sb_clear"):
             try:
                 st.cache_data.clear()
                 st.cache_resource.clear()
@@ -52,7 +53,6 @@ with st.sidebar:
             st.session_state.stop_requested = False
             st.session_state.relaxed_cif = None
             st.session_state.relax_traj_xyz = None
-            # clean any temp files we recorded
             for p in st.session_state.tmp_paths:
                 try: os.remove(p)
                 except Exception: pass
@@ -77,13 +77,13 @@ with tab_view:
     viewer_tab(pmg_obj)
 
 with tab_relax:
-    relax_tab(pmg_obj)
+    relax_tab(pmg_obj, chgnet_variant)
 
 with tab_elastic:
-    elastic_tab(pmg_obj)
+    elastic_tab(pmg_obj)   # Atomate2 uses CHGNet internally
 
 with tab_phonon:
     phonon_tab(pmg_obj)
 
 with tab_md:
-    md_tab(pmg_obj)
+    md_tab(pmg_obj, chgnet_variant)
