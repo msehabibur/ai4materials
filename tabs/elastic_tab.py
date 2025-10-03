@@ -7,6 +7,7 @@ import numpy as np
 import streamlit as st
 from pymatgen.core import Structure
 
+from monty.json import jsanitize  # <-- key: turn typed objects into plain dicts
 from atomate2.forcefields.flows.elastic import ElasticMaker
 from atomate2.forcefields.jobs import MACERelaxMaker
 from jobflow import run_locally
@@ -48,12 +49,12 @@ def _pack_csv(C: np.ndarray, props: dict) -> bytes:
 
 
 # ---------- robust extractors ----------
-def _maybe_tensor_from_dict(d: dict) -> Optional[Tuple[List[List[float]], dict]]:
+def _maybe_tensor_from_plain_dict(d: dict) -> Optional[Tuple[List[List[float]], dict]]:
     """
-    Try the common shapes used by atomate2 elastic flows across versions.
+    Try common shapes used by atomate2 elastic flows across versions.
     Return (C_ij_GPa, props_dict) if found.
     """
-    # 1) Newer atomate2: {"elastic_tensor": {"ieee_format": 6x6}, "derived_properties": {...}}
+    # 1) {"elastic_tensor": {"ieee_format": 6x6}, "derived_properties": {...}}
     if "elastic_tensor" in d and isinstance(d["elastic_tensor"], dict):
         et = d["elastic_tensor"]
         mat = et.get("ieee_format") or et.get("matrix") or et.get("C_ij") or None
@@ -61,85 +62,106 @@ def _maybe_tensor_from_dict(d: dict) -> Optional[Tuple[List[List[float]], dict]]
             props = d.get("derived_properties", {}) or {}
             return _to_gpa(mat), _to_gpa(props)
 
-    # 2) Minimal dict with keys already flat
+    # 2) Minimal: {"C_ij": ..., "properties": {...}}
     if all(k in d for k in ("C_ij", "properties")):
         return _to_gpa(d["C_ij"]), _to_gpa(d["properties"])
 
-    # 3) Some flows tuck results under "output" or "data"
+    # 3) Some flows tuck results under "output"/"data"/"result"/"results"
     for k in ("output", "data", "result", "results"):
-        if isinstance(d.get(k), dict):
-            out = _maybe_tensor_from_dict(d[k])
+        v = d.get(k)
+        if isinstance(v, dict):
+            out = _maybe_tensor_from_plain_dict(v)
             if out:
                 return out
-
     return None
 
 
-def _walk_for_tensor(obj: Any) -> Optional[Tuple[List[List[float]], dict]]:
-    """Recursively walk any nested structure looking for an elastic tensor + props."""
+def _to_plain(obj: Any) -> Any:
+    """
+    Convert any monty-serializable/typed object to plain JSON-friendly Python types.
+    """
+    try:
+        return jsanitize(obj, strict=False)
+    except Exception:
+        # Best effort fallback
+        if hasattr(obj, "as_dict"):
+            try:
+                return jsanitize(obj.as_dict(), strict=False)
+            except Exception:
+                return obj
+        return obj
+
+
+def _walk_plain_for_tensor(obj: Any) -> Optional[Tuple[List[List[float]], dict]]:
+    """Recursively walk any plain structure looking for an elastic tensor + props."""
     if isinstance(obj, dict):
-        got = _maybe_tensor_from_dict(obj)
+        got = _maybe_tensor_from_plain_dict(obj)
         if got:
             return got
         for v in obj.values():
-            hit = _walk_for_tensor(v)
+            hit = _walk_plain_for_tensor(v)
             if hit:
                 return hit
     elif isinstance(obj, (list, tuple)):
         for v in obj:
-            hit = _walk_for_tensor(v)
+            hit = _walk_plain_for_tensor(v)
             if hit:
                 return hit
-    return None
-
-
-def _extract_elastic_from_any(obj: Any) -> Optional[Tuple[np.ndarray, dict]]:
-    """Helper: try to find and return (C_ij ndarray, props dict) from any nested object."""
-    found = _walk_for_tensor(obj)
-    if found:
-        C, P = found
-        return np.array(C, dtype=float), P or {}
     return None
 
 
 def _extract_elastic(rs: Dict[str, Any], flow_obj: Any) -> Tuple[np.ndarray, dict, dict]:
     """
-    Resolve flow.output first (jobflow references), then fall back to responses.
+    Resolve flow.output first (jobflow references), sanitize to plain dicts,
+    then fall back to sanitized job outputs.
     Returns (C_ij_GPa ndarray, props dict, debug_meta dict)
     """
     debug_meta = {"jobs_seen": [], "found_in": None}
 
-    # Pass 0: resolve flow outputs (most reliable place)
+    # Pass 0: try resolving flow.output (most reliable)
     try:
         resolved = flow_obj.output.resolve(rs)
-        got = _extract_elastic_from_any(resolved)
+        resolved_plain = _to_plain(resolved)
+        got = _walk_plain_for_tensor(resolved_plain)
         if got:
             C, P = got
             debug_meta["found_in"] = {"scope": "flow.output.resolve(rs)"}
-            return C, P, debug_meta
+            return np.array(C, dtype=float), P or {}, debug_meta
     except Exception:
-        # If resolve isn't available / fails, continue
-        pass
+        pass  # continue
 
-    # Pass 1: look in each job's output+metadata
+    # Pass 1: sanitize per-job output & metadata
     for jid, rec in rs.items():
         debug_meta["jobs_seen"].append({"id": str(jid), "name": getattr(rec, "name", None)})
         for field in ("output", "metadata"):
             obj = getattr(rec, field, None)
             if obj is None:
                 continue
-            got = _extract_elastic_from_any(obj)
+            plain = _to_plain(obj)
+            got = _walk_plain_for_tensor(plain)
             if got:
                 C, P = got
                 debug_meta["found_in"] = {"job_id": str(jid), "field": field}
-                return C, P, debug_meta
+                return np.array(C, dtype=float), P or {}, debug_meta
 
-    # Pass 2: scan the whole structure (paranoia)
-    got = _extract_elastic_from_any(rs)
+    # Pass 2: look for a job named like 'fit_elastic_tensor' explicitly
+    for jid, rec in rs.items():
+        name = (getattr(rec, "name", "") or "").lower()
+        if "fit_elastic" in name or "elastic" in name:
+            plain = _to_plain(getattr(rec, "output", None))
+            got = _walk_plain_for_tensor(plain)
+            if got:
+                C, P = got
+                debug_meta["found_in"] = {"job_id": str(jid), "field": "output(name-match)"}
+                return np.array(C, dtype=float), P or {}, debug_meta
+
+    # Pass 3: sanitize whole responses & deep-scan as last resort
+    whole_plain = _to_plain(rs)
+    got = _walk_plain_for_tensor(whole_plain)
     if got:
         C, P = got
         debug_meta["found_in"] = {"scope": "responses-deep-scan"}
-        return C, P, debug_meta
+        return np.array(C, dtype=float), P or {}, debug_meta
 
     raise RuntimeError("Elastic results not found in job outputs.")
 
@@ -249,11 +271,11 @@ def elastic_tab(pmg_obj: Structure | None):
             ensure_success=True
         )
 
-        # Small job table for sanity
+        # Small job table for sanity (names can be UUID-like in some versions)
         rows = []
         for j, r in rs.items():
-            name = (getattr(r, "name", None) or str(j))[:80].replace("CHGNet", "MACE")
-            rows.append({"job": str(j)[:8], "name": name, "error": bool(getattr(r, "error", None))})
+            nm = (getattr(r, "name", None) or str(j))
+            rows.append({"job": str(j)[:8], "name": nm[:80], "error": bool(getattr(r, "error", None))})
         st.dataframe(rows, use_container_width=True)
 
         status.update(label="Extracting results…", state="running")
