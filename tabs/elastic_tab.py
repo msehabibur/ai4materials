@@ -11,12 +11,11 @@ from pymatgen.core import Structure
 from monty.json import jsanitize
 from atomate2.forcefields.flows.elastic import ElasticMaker
 from atomate2.forcefields.jobs import MACERelaxMaker
-from jobflow import run_locally
+from jobflow import run_locally, SETTINGS  # <-- use SETTINGS.JOB_STORE
 
 
 # ---------- utils ----------
 def _to_plain(obj: Any) -> Any:
-    """Convert monty/MSON/typed objects to plain Python (dict/list/num/str)."""
     try:
         return jsanitize(obj, strict=False)
     except Exception:
@@ -29,14 +28,12 @@ def _to_plain(obj: Any) -> Any:
 
 
 def _to_gpa(val: Any):
-    """Convert values that look like Pascals to GPa; recurse through lists/dicts."""
     if val is None:
         return None
     if isinstance(val, dict):
         return {k: _to_gpa(v) for k, v in val.items()}
     arr = np.array(val, dtype=float)
-    # Heuristic: if magnitudes are large, assume Pa and convert to GPa.
-    if np.nanmax(np.abs(arr)) > 1e5:
+    if np.nanmax(np.abs(arr)) > 1e5:  # likely Pascals
         arr = arr * 1e-9
     if arr.ndim == 0:
         return float(arr)
@@ -63,13 +60,10 @@ def _pack_csv(C: np.ndarray, props: dict) -> bytes:
 
 # ---------- robust extraction ----------
 def _looks_like_6x6(mat: Any) -> bool:
-    """True if mat appears to be a 6×6 numeric array/list."""
     if isinstance(mat, (list, tuple)) and len(mat) == 6:
         try:
-            rows = list(mat)
-            if all(isinstance(r, (list, tuple)) and len(r) == 6 for r in rows):
-                # check numeric
-                for r in rows:
+            if all(isinstance(r, (list, tuple)) and len(r) == 6 for r in mat):
+                for r in mat:
                     for x in r:
                         if not isinstance(x, numbers.Number):
                             return False
@@ -80,38 +74,25 @@ def _looks_like_6x6(mat: Any) -> bool:
 
 
 def _maybe_tensor_anywhere(d: Any) -> Optional[List[List[float]]]:
-    """
-    Extremely permissive search:
-    - Known keys: elastic_tensor.{ieee_format, voigt, matrix, C_ij, C}
-    - Flat keys: C_ij, C, tensor, elastic, elastic_voigt
-    - If not found by keys, find the FIRST 6×6 numeric matrix anywhere.
-    """
-    # Depth-first search
     stack: List[Any] = [d]
     while stack:
         cur = stack.pop()
         if isinstance(cur, dict):
-            # Known shapes
             et = cur.get("elastic_tensor")
             if isinstance(et, dict):
                 for k in ("ieee_format", "voigt", "matrix", "C_ij", "C"):
                     if k in et and _looks_like_6x6(et[k]):
-                        return _to_gpa(et[k])  # Pa->GPa if needed
+                        return _to_gpa(et[k])
             for k in ("C_ij", "C", "tensor", "elastic", "elastic_voigt"):
                 if k in cur and _looks_like_6x6(cur[k]):
                     return _to_gpa(cur[k])
-            # Push nested dict-like containers
             for child_key in ("output", "data", "result", "results", "elastic_data", "elastic"):
                 if child_key in cur:
                     stack.append(cur[child_key])
-            # Push all values for brute-force scan
             stack.extend(list(cur.values()))
         elif isinstance(cur, (list, tuple)):
             stack.extend(list(cur))
-        else:
-            # Primitive — ignore
-            pass
-    # Secondary pass: brute-force matrix hunt
+    # brute-force fallback
     def walk_for_matrix(x: Any) -> Optional[List[List[float]]]:
         if _looks_like_6x6(x):
             return _to_gpa(x)
@@ -130,12 +111,10 @@ def _maybe_tensor_anywhere(d: Any) -> Optional[List[List[float]]]:
 
 
 def _props_from_any(d: Any) -> dict:
-    """Best-effort to extract derived properties dict from near-by keys."""
     if isinstance(d, dict):
         for k in ("derived_properties", "properties"):
             if k in d and isinstance(d[k], dict):
                 return _to_gpa(d[k])
-        # Search nested spots
         for k in ("output", "data", "result", "results", "elastic_data", "elastic"):
             if k in d and isinstance(d[k], dict):
                 found = _props_from_any(d[k])
@@ -146,46 +125,67 @@ def _props_from_any(d: Any) -> dict:
 
 def _extract_elastic(rs: Union[Dict[str, Any], List[Any]], flow_obj: Any) -> Tuple[np.ndarray, dict, dict, Any, list]:
     """
-    Resolve flow outputs, sanitize, extract tensor (C 6×6) and props.
+    Resolve against the JOB_STORE, not the responses dict.
     Returns: (C ndarray, props dict, meta dict, resolved_plain, samples)
     """
+    store = getattr(SETTINGS, "JOB_STORE", None)
     meta = {"found_in": None, "jobs_seen": []}
-
-    # Pass 0: resolve flow.output against responses
     resolved_plain = None
-    try:
-        resolved = flow_obj.output.resolve(rs)
-        resolved_plain = _to_plain(resolved)
-        C = _maybe_tensor_anywhere(resolved_plain)
-        if C is not None:
-            P = _props_from_any(resolved_plain)
-            meta["found_in"] = {"scope": "flow.output.resolve(rs)"}
-            return np.array(C, dtype=float), P, meta, resolved_plain, []
-    except Exception:
-        pass  # continue
+
+    # Pass 0: resolve flow.output with store
+    if store is not None:
+        try:
+            resolved = flow_obj.output.resolve(store)
+            resolved_plain = _to_plain(resolved)
+            C = _maybe_tensor_anywhere(resolved_plain)
+            if C is not None:
+                P = _props_from_any(resolved_plain)
+                meta["found_in"] = {"scope": "flow.output.resolve(store)"}
+                return np.array(C, dtype=float), P, meta, resolved_plain, []
+        except Exception:
+            pass  # continue
 
     # Normalize rs iterable
     items = list(rs.items()) if isinstance(rs, dict) else list(enumerate(rs))
 
-    # Pass 1: per-job outputs (sanitize) — collect 5 samples for UI
+    # Pass 1: per-job outputs — resolve references via store if possible
     samples = []
     for i, (jid, rec) in enumerate(items):
         name = getattr(rec, "name", None)
         meta["jobs_seen"].append({"id": str(jid), "name": name})
-        for field in ("output", "metadata"):
-            obj = getattr(rec, field, None)
-            if obj is None:
-                continue
-            plain = _to_plain(obj)
-            if field == "output" and len(samples) < 5:
-                samples.append({"job_id": str(jid), "name": name, "output_sample": plain})
-            C = _maybe_tensor_anywhere(plain)
-            if C is not None:
-                P = _props_from_any(plain)
-                meta["found_in"] = {"job_id": str(jid), "field": field}
-                return np.array(C, dtype=float), P, meta, resolved_plain, samples
 
-    # Pass 2: whole responses deep-scan
+        out_obj = getattr(rec, "output", None)
+
+        # Try resolving job output reference via store
+        plain = None
+        if store is not None and hasattr(out_obj, "resolve"):
+            try:
+                resolved = out_obj.resolve(store)
+                plain = _to_plain(resolved)
+            except Exception:
+                plain = _to_plain(out_obj)
+        else:
+            plain = _to_plain(out_obj)
+
+        if i < 5:
+            samples.append({"job_id": str(jid), "name": name, "output_sample": plain})
+
+        C = _maybe_tensor_anywhere(plain)
+        if C is not None:
+            P = _props_from_any(plain)
+            meta["found_in"] = {"job_id": str(jid), "field": "output(resolved)"}
+            return np.array(C, dtype=float), P, meta, resolved_plain, samples
+
+        # Also peek at metadata (rare but possible)
+        meta_obj = getattr(rec, "metadata", None)
+        meta_plain = _to_plain(meta_obj)
+        C = _maybe_tensor_anywhere(meta_plain)
+        if C is not None:
+            P = _props_from_any(meta_plain)
+            meta["found_in"] = {"job_id": str(jid), "field": "metadata"}
+            return np.array(C, dtype=float), P, meta, resolved_plain, samples
+
+    # Pass 2: deep-scan whole responses
     whole_plain = _to_plain(rs)
     C = _maybe_tensor_anywhere(whole_plain)
     if C is not None:
@@ -309,7 +309,7 @@ def elastic_tab(pmg_obj: Structure | None):
         status.update(label="Done ✅", state="complete")
         _render_payload(payload)
 
-        # Show sanitized raw objects (helps future debugging but safe when success)
+        # Diagnostics (sanitized)
         with st.expander("Resolved flow.output (sanitized)", expanded=False):
             st.json(_to_plain(resolved_plain))
         if samples:
@@ -318,20 +318,34 @@ def elastic_tab(pmg_obj: Structure | None):
 
     except Exception as e:
         st.error(f"Elastic workflow failed: {e}")
-        # Dump small sanitized samples so we can see where results live
+        # Show sanitized data to pinpoint shapes
         with st.expander("Resolved flow.output (sanitized)", expanded=True):
             try:
-                resolved = flow.output.resolve(rs)  # may fail; that's fine
-                st.json(_to_plain(resolved))
+                store = getattr(SETTINGS, "JOB_STORE", None)
+                if store is not None:
+                    resolved = flow.output.resolve(store)
+                    st.json(_to_plain(resolved))
+                else:
+                    st.write("(No job store available)")
             except Exception as ee:
-                st.write(f"(Could not resolve flow.output: {ee})")
+                st.write(f"(Could not resolve with store: {ee})")
         with st.expander("Sample job outputs (sanitized)", expanded=True):
             dump = []
             items = list(rs.items()) if isinstance(rs, dict) else list(enumerate(rs))
             for i, (j, r) in enumerate(items):
                 if i >= 5:
                     break
-                dump.append({"job": str(j), "name": getattr(r, "name", None), "output": _to_plain(getattr(r, "output", None))})
+                out_obj = getattr(r, "output", None)
+                store = getattr(SETTINGS, "JOB_STORE", None)
+                if store is not None and hasattr(out_obj, "resolve"):
+                    try:
+                        resolved = out_obj.resolve(store)
+                        plain = _to_plain(resolved)
+                    except Exception:
+                        plain = _to_plain(out_obj)
+                else:
+                    plain = _to_plain(out_obj)
+                dump.append({"job": str(j), "name": getattr(r, "name", None), "output": plain})
             st.json(dump)
         with st.expander("Exception", expanded=False):
             st.exception(e)
