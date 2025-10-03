@@ -78,57 +78,40 @@ def _looks_like_6x6(mat: Any) -> bool:
 
 
 def _maybe_tensor_anywhere(d: Any) -> Optional[List[List[float]]]:
-    """
-    Robustly search for a 6x6 elastic tensor matrix within a nested data structure.
-    This version is updated to prioritize common keys like 'elastic_tensor'.
-    """
+    """Robustly search for a 6x6 elastic tensor matrix within a nested data structure."""
     stack: List[Any] = [d]
     while stack:
         cur = stack.pop()
         if isinstance(cur, dict):
-            # Prioritize searching for "elastic_tensor" as it is the most common output key.
             et = cur.get("elastic_tensor")
-            
-            # If et is a 6x6 matrix, return it immediately.
             if _looks_like_6x6(et):
                 return _to_gpa(et)
-
-            # If et is a dictionary, search within it for common matrix formats.
             if isinstance(et, dict):
                 for k in ("ieee_format", "voigt", "matrix", "C_ij", "C"):
                     if k in et and _looks_like_6x6(et[k]):
                         return _to_gpa(et[k])
-            
-            # Continue with the original search logic for other possible keys.
             for k in ("C_ij", "C", "tensor", "elastic", "elastic_voigt"):
                 if k in cur and _looks_like_6x6(cur[k]):
                     return _to_gpa(cur[k])
-            
-            # Add child keys to the stack for further searching.
             for child_key in ("output", "data", "result", "results", "elastic_data", "elastic"):
                 if child_key in cur:
                     stack.append(cur[child_key])
             stack.extend(list(cur.values()))
-
         elif isinstance(cur, (list, tuple)):
             stack.extend(list(cur))
-
-    # Fallback: brute-force walk through the data structure.
+    
     def walk_for_matrix(x: Any) -> Optional[List[List[float]]]:
         if _looks_like_6x6(x):
             return _to_gpa(x)
         if isinstance(x, dict):
             for v in x.values():
                 got = walk_for_matrix(v)
-                if got is not None:
-                    return got
+                if got is not None: return got
         elif isinstance(x, (list, tuple)):
             for v in x:
                 got = walk_for_matrix(v)
-                if got is not None:
-                    return got
+                if got is not None: return got
         return None
-        
     return walk_for_matrix(d)
 
 
@@ -147,15 +130,30 @@ def _props_from_any(d: Any) -> dict:
 
 
 def _extract_elastic(rs: Union[Dict[str, Any], List[Any]], flow_obj: Any) -> Tuple[np.ndarray, dict, dict, Any, list]:
-    """
-    Resolve and extract elastic tensor and properties from jobflow results.
-    Returns: (C ndarray, props dict, meta dict, resolved_plain, samples)
-    """
+    """Resolve and extract elastic tensor and properties from jobflow results."""
     store = getattr(SETTINGS, "JOB_STORE", None)
     meta = {"found_in": None, "jobs_seen": []}
     resolved_plain = None
+    samples = []
 
-    # Pass 0: resolve flow.output with store
+    items = list(rs.items()) if isinstance(rs, dict) else list(enumerate(rs))
+
+    # Pass 0: Specifically look for the analysis job by name, as it's the most likely source
+    for jid, rec in items:
+        name = getattr(rec, "name", None)
+        if name and "elastic_analysis" in name:
+            analysis_output = _to_plain(getattr(rec, "output", None))
+            C = _maybe_tensor_anywhere(analysis_output)
+            if C is not None:
+                P = _props_from_any(analysis_output)
+                meta["found_in"] = {"scope": f"job '{name}' ({str(jid)})"}
+                try:
+                    resolved_plain = _to_plain(flow_obj.output.resolve(store))
+                except Exception:
+                    pass
+                return np.array(C, dtype=float), P, meta, resolved_plain, samples
+
+    # Pass 1: Resolve flow.output with store (often points to the analysis job)
     if store is not None:
         try:
             resolved = flow_obj.output.resolve(store)
@@ -166,49 +164,23 @@ def _extract_elastic(rs: Union[Dict[str, Any], List[Any]], flow_obj: Any) -> Tup
                 meta["found_in"] = {"scope": "flow.output.resolve(store)"}
                 return np.array(C, dtype=float), P, meta, resolved_plain, []
         except Exception:
-            pass  # continue
+            pass
 
-    # Normalize rs iterable
-    items = list(rs.items()) if isinstance(rs, dict) else list(enumerate(rs))
-
-    # Pass 1: per-job outputs — resolve references via store if possible
-    samples = []
+    # Pass 2: Fallback to iterating through all job outputs
     for i, (jid, rec) in enumerate(items):
         name = getattr(rec, "name", None)
         meta["jobs_seen"].append({"id": str(jid), "name": name})
-
         out_obj = getattr(rec, "output", None)
-
-        # Try resolving job output reference via store
-        plain = None
-        if store is not None and hasattr(out_obj, "resolve"):
-            try:
-                resolved = out_obj.resolve(store)
-                plain = _to_plain(resolved)
-            except Exception:
-                plain = _to_plain(out_obj)
-        else:
-            plain = _to_plain(out_obj)
-
+        plain = _to_plain(out_obj)
         if i < 5:
             samples.append({"job_id": str(jid), "name": name, "output_sample": plain})
-
         C = _maybe_tensor_anywhere(plain)
         if C is not None:
             P = _props_from_any(plain)
-            meta["found_in"] = {"job_id": str(jid), "field": "output(resolved)"}
+            meta["found_in"] = {"job_id": str(jid), "field": "output"}
             return np.array(C, dtype=float), P, meta, resolved_plain, samples
 
-        # Also peek at metadata (rare but possible)
-        meta_obj = getattr(rec, "metadata", None)
-        meta_plain = _to_plain(meta_obj)
-        C = _maybe_tensor_anywhere(meta_plain)
-        if C is not None:
-            P = _props_from_any(meta_plain)
-            meta["found_in"] = {"job_id": str(jid), "field": "metadata"}
-            return np.array(C, dtype=float), P, meta, resolved_plain, samples
-
-    # Pass 2: deep-scan whole responses
+    # Pass 3: Final deep scan of the entire responses dictionary
     whole_plain = _to_plain(rs)
     C = _maybe_tensor_anywhere(whole_plain)
     if C is not None:
@@ -216,7 +188,7 @@ def _extract_elastic(rs: Union[Dict[str, Any], List[Any]], flow_obj: Any) -> Tup
         meta["found_in"] = {"scope": "responses-deep-scan"}
         return np.array(C, dtype=float), P, meta, resolved_plain, samples
 
-    raise RuntimeError("Elastic results not found in job outputs.")
+    raise RuntimeError("Elastic results not found. The workflow may have failed or the output format is unexpected.")
 
 
 # ---------- render ----------
@@ -268,13 +240,8 @@ def elastic_tab(pmg_obj: Structure | None):
     c1, c2 = st.columns(2)
     with c1:
         fmax = st.number_input(
-            "Relax fmax (eV/Å)",
-            min_value=1e-8,
-            max_value=1e-1,
-            value=1e-5,
-            step=1e-8,
-            format="%.0e",
-            disabled=disabled,
+            "Relax fmax (eV/Å)", min_value=1e-8, max_value=1e-1, value=1e-4,
+            step=1e-5, format="%.1e", disabled=disabled, help="Force convergence threshold for relaxation."
         )
     with c2:
         allow_cell = st.selectbox(
@@ -284,7 +251,6 @@ def elastic_tab(pmg_obj: Structure | None):
 
     run_btn = st.button("Run Elastic Workflow", type="primary", disabled=disabled)
 
-    # Show last results if available
     if st.session_state.elastic_payload and not st.session_state.elastic_running:
         st.success("Successfully calculated elastic properties!")
         _render_payload(st.session_state.elastic_payload)
@@ -294,101 +260,84 @@ def elastic_tab(pmg_obj: Structure | None):
     if not run_btn or st.session_state.elastic_running:
         return
 
-    # === run workflow on button press ===
     st.session_state.elastic_running = True
-    st.session_state.elastic_payload = None # Clear previous results
+    st.session_state.elastic_payload = None
     st.session_state.elastic_debug = None
     
-    # Placeholders for results and diagnostics
-    results_placeholder = st.empty()
-    diagnostics_placeholder = st.empty()
+    flow = None
+    rs = None
 
     try:
         with st.status("Building and running elastic workflow...", expanded=True) as status:
-            status.write("Preparing makers...")
-            bulk_relax = MACERelaxMaker(relax_cell=True,  relax_kwargs={"fmax": float(fmax)})
-            el_relax   = MACERelaxMaker(relax_cell=bool(allow_cell), relax_kwargs={"fmax": float(fmax)})
+            status.write("Preparing MACE makers with universal model...")
+            
+            # **CRITICAL CHANGE**: Explicitly specify a universal MACE model.
+            mace_model = "mace_mp_20210725_medium"
+            
+            bulk_relax = MACERelaxMaker(
+                model=mace_model, relax_cell=True, relax_kwargs={"fmax": float(fmax)}
+            )
+            el_relax = MACERelaxMaker(
+                model=mace_model, relax_cell=bool(allow_cell), relax_kwargs={"fmax": float(fmax)}
+            )
 
             maker = ElasticMaker(bulk_relax_maker=bulk_relax, elastic_relax_maker=el_relax)
             flow = maker.make(structure=pmg_obj)
 
-            status.update(label="Running workflow locally...")
+            status.update(label=f"Running workflow locally with {len(flow)} jobs...")
+            # Use ensure_success=False to capture the results even if a job fails
             rs = run_locally(flow, create_folders=True, ensure_success=True)
-
-            # Display a quick job summary table
-            rows = []
-            items = list(rs.items()) if isinstance(rs, dict) else list(enumerate(rs))
-            for j, r in items:
-                nm = (getattr(r, "name", None) or str(j))
-                rows.append({"job": str(j)[:8], "name": nm[:80], "error": bool(getattr(r, "error", None))})
-            st.dataframe(rows, use_container_width=True)
 
             status.update(label="Extracting results from outputs...")
             C, P, meta, resolved_plain, samples = _extract_elastic(rs, flow)
 
-            # Backfill Young's modulus and Poisson's ratio if missing
             K, G = P.get("k_vrh"), P.get("g_vrh")
             if isinstance(K, (int, float)) and isinstance(G, (int, float)):
                 denom = 3 * K + G
-                if denom > 1e-9: # Avoid division by zero
+                if denom > 1e-9:
                     P.setdefault("y_mod", 9 * K * G / denom)
                     P.setdefault("homogeneous_poisson", (3 * K - 2 * G) / (2 * denom))
 
             payload = {"C_GPa": np.array(C, dtype=float).tolist(), "props": P}
             st.session_state.elastic_payload = payload
             st.session_state.elastic_debug = {"found_in": meta.get("found_in"), "jobs_seen": meta.get("jobs_seen")}
-
+            
             status.update(label="Workflow complete!", state="complete", expanded=False)
-
-            with results_placeholder.container():
-                st.success("Successfully calculated elastic properties!")
-                _render_payload(payload)
-
-            with diagnostics_placeholder.container():
-                with st.expander("Resolved flow output (sanitized)", expanded=False):
-                    st.json(_to_plain(resolved_plain))
-                if samples:
-                    with st.expander("Sample job outputs (sanitized)", expanded=False):
-                        st.json(_to_plain(samples))
 
     except Exception as e:
         st.error(f"Elastic workflow failed: {e}")
-        # Show sanitized data to help pinpoint data structure issues
-        with diagnostics_placeholder.container():
-            with st.expander("Resolved flow output (sanitized)", expanded=True):
-                try:
-                    store = getattr(SETTINGS, "JOB_STORE", None)
-                    if store is not None and 'flow' in locals():
-                        resolved = flow.output.resolve(store)
-                        st.json(_to_plain(resolved))
-                    else:
-                        st.write("(No job store available or flow not created)")
-                except Exception as ee:
-                    st.write(f"(Could not resolve with store: {ee})")
-            
-            with st.expander("Sample job outputs (sanitized)", expanded=True):
-                if 'rs' in locals():
-                    dump = []
-                    items = list(rs.items()) if isinstance(rs, dict) else list(enumerate(rs))
-                    for i, (j, r) in enumerate(items):
-                        if i >= 5: break
-                        out_obj = getattr(r, "output", None)
-                        store = getattr(SETTINGS, "JOB_STORE", None)
-                        if store is not None and hasattr(out_obj, "resolve"):
-                            try:
-                                resolved = out_obj.resolve(store)
-                                plain = _to_plain(resolved)
-                            except Exception:
-                                plain = _to_plain(out_obj)
-                        else:
-                            plain = _to_plain(out_obj)
-                        dump.append({"job": str(j), "name": getattr(r, "name", None), "output": plain})
-                    st.json(dump)
-                else:
-                    st.write("(No job responses 'rs' available)")
+        st.info("Please expand the sections below to diagnose the issue. The most common cause is a failure in one of the calculation jobs.")
+        
+        # Display diagnostics to help debug the failure
+        with st.expander("Job summary from workflow run", expanded=True):
+            if rs:
+                rows = []
+                items = list(rs.items()) if isinstance(rs, dict) else list(enumerate(rs))
+                for j, r in items:
+                    error_info = getattr(r, "error", None) or getattr(r, "traceback", None)
+                    rows.append({
+                        "job_uuid": str(j), 
+                        "name": getattr(r, "name", "N/A"), 
+                        "was_successful": error_info is None
+                    })
+                st.dataframe(rows, use_container_width=True)
+                st.write("If any job was not successful, the workflow could not complete.")
+            else:
+                st.write("No job response data was generated. The failure likely occurred before the workflow started running.")
 
-            with st.expander("Full Exception Traceback", expanded=False):
-                st.exception(e)
+        with st.expander("Full Exception Traceback", expanded=False):
+            st.exception(e)
+
+        with st.expander("Sample job outputs (if any)", expanded=False):
+            if rs:
+                dump = []
+                items = list(rs.items()) if isinstance(rs, dict) else list(enumerate(rs))
+                for i, (j, r) in enumerate(items):
+                    if i >= 5: break
+                    dump.append({"job": str(j), "name": getattr(r, "name", None), "output": _to_plain(getattr(r, "output", None))})
+                st.json(dump)
+            else:
+                st.write("No job responses available.")
     finally:
         st.session_state.elastic_running = False
-        st.rerun() 
+        st.rerun()
