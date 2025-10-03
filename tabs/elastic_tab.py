@@ -54,7 +54,6 @@ class NoOpStore:
     def __init__(self): self._ok = False
     def connect(self): self._ok = True
     def close(self): pass
-    # methods below exist so jobflow doesn't explode if it calls them
     def write_document(self, *a, **k): return None
     def write_many(self, *a, **k): return None
     def update(self, *a, **k): return None
@@ -68,7 +67,6 @@ def _ensure_store() -> tuple[object, Optional[str]]:
     Guarantee SETTINGS.JOB_STORE is a usable instance.
     Returns (store, store_dir_if_filestore_else_None)
     """
-    # Prefer an on-disk FileStore (best interop with many jobflow versions)
     store_dir = None
     try:
         if FileStore is not None:
@@ -80,7 +78,6 @@ def _ensure_store() -> tuple[object, Optional[str]]:
     except Exception:
         store_dir = None
 
-    # Fall back to an in-memory store
     try:
         if MemoryStore is not None:
             store = MemoryStore()
@@ -89,7 +86,6 @@ def _ensure_store() -> tuple[object, Optional[str]]:
     except Exception:
         pass
 
-    # Final fallback: a no-op store that at least has connect()
     store = NoOpStore()
     SETTINGS.JOB_STORE = store
     return store, None
@@ -114,8 +110,7 @@ def _to_gpa(val: Any):
     if isinstance(val, dict):
         return {k: _to_gpa(v) for k, v in val.items()}
     arr = np.array(val, dtype=float)
-    # If it looks like Pascals, convert to GPa
-    if np.nanmax(np.abs(arr)) > 1e5:
+    if np.nanmax(np.abs(arr)) > 1e5:  # likely Pascals
         arr = arr * 1e-9
     if arr.ndim == 0:
         return float(arr)
@@ -156,7 +151,6 @@ def _looks_like_6x6(mat: Any) -> bool:
 
 
 def _maybe_tensor_anywhere(d: Any) -> Optional[List[List[float]]]:
-    # Known paths first
     if isinstance(d, dict):
         et = d.get("elastic_tensor")
         if isinstance(et, dict):
@@ -167,14 +161,13 @@ def _maybe_tensor_anywhere(d: Any) -> Optional[List[List[float]]]:
             if k in d and _looks_like_6x6(d[k]):
                 return _to_gpa(d[k])
 
-    # Deep search
     def walk(x: Any) -> Optional[List[List[float]]]:
         if _looks_like_6x6(x):
             return _to_gpa(x)
         if isinstance(x, dict):
             for sub in ("output", "data", "result", "results", "elastic_data", "elastic", "metadata"):
                 if sub in x:
-                    got = walk(x[sub])
+                    got = walk(x[sub]);  # noqa: E702
                     if got is not None:
                         return got
             for v in x.values():
@@ -206,7 +199,6 @@ def _props_from_any(d: Any) -> dict:
 
 def _extract_via_store(store, rs, flow_obj):
     """Resolve flow and job outputs via a real store (if it supports resolve)."""
-    # Try flow.output first
     try:
         if hasattr(flow_obj.output, "resolve"):
             resolved = flow_obj.output.resolve(store)
@@ -218,7 +210,6 @@ def _extract_via_store(store, rs, flow_obj):
     except Exception:
         pass
 
-    # Then job outputs/metadata
     samples = []
     jobs_seen = []
     items = list(rs.items()) if isinstance(rs, dict) else list(enumerate(rs))
@@ -254,9 +245,7 @@ def _extract_via_store(store, rs, flow_obj):
 
 
 def _extract_via_files(store_dir: str):
-    """
-    Last-resort: scan the FileStore directory for JSON docs and pull a 6×6 tensor.
-    """
+    """Last-resort: scan the FileStore directory for JSON docs and pull a 6×6 tensor."""
     if not store_dir or not os.path.isdir(store_dir):
         return None
     json_paths = []
@@ -290,7 +279,7 @@ def _render_payload(payload: dict):
     cA, cB, cC = st.columns(3)
     cA.metric("K_VRH (GPa)", f"{P.get('k_vrh', float('nan')):.3f}" if P.get("k_vrh") is not None else "—")
     cB.metric("G_VRH (GPa)", f"{P.get('g_vrh', float('nan')):.3f}" if P.get("g_vrh") is not None else "—")
-    cC.metric("E (GPa)",     f"{P.get("y_mod", float('nan')):.3f}" if P.get("y_mod") is not None else "—")
+    cC.metric("E (GPa)",     f"{P.get('y_mod', float('nan')):.3f}" if P.get('y_mod') is not None else "—")
 
     cD, cE = st.columns(2)
     po = P.get("homogeneous_poisson", None)
@@ -383,7 +372,7 @@ def elastic_tab(pmg_obj: Structure | None):
             # 2) Filesystem fallback: scan JSON docs under the FileStore
             got = _extract_via_files(store_dir)
         if not got:
-            # 3) As a last resort, deep-scan responses object (may be plain dicts)
+            # 3) As a last resort, deep-scan responses object (plain dicts)
             whole_plain = _to_plain(rs)
             C = _maybe_tensor_anywhere(whole_plain)
             if C is not None:
