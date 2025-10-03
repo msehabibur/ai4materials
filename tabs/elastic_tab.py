@@ -189,7 +189,7 @@ def _render_payload(payload: dict):
 
 # ---------- tab ----------
 def elastic_tab(pmg_obj: Structure | None):
-    st.subheader("🧱 Elastic — default flow (MACE)")
+    st.subheader("🧱 Elastic)")
     if pmg_obj is None:
         st.info("Upload/select a structure in the Viewer first.")
         return
