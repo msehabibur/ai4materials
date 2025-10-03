@@ -16,7 +16,7 @@ from atomate2.forcefields.flows.elastic import ElasticMaker
 from atomate2.forcefields.jobs import MACERelaxMaker
 from jobflow import run_locally, SETTINGS
 
-# ---- Compat imports for stores ----
+# ---- Try to import a concrete Store implementation from jobflow (many versions) ----
 FileStore = None
 MemoryStore = None
 try:
@@ -24,20 +24,75 @@ try:
     FileStore = _FS
 except Exception:
     try:
-        from jobflow.managers.base import FileStore as _FS  # older jobflow
+        from jobflow.core.store import FileStore as _FS  # alt path
         FileStore = _FS
     except Exception:
-        FileStore = None
+        try:
+            from jobflow.managers.base import FileStore as _FS  # very old path
+            FileStore = _FS
+        except Exception:
+            FileStore = None
 
 try:
     from jobflow import MemoryStore as _MS
     MemoryStore = _MS
 except Exception:
     try:
-        from jobflow.managers.base import MemoryStore as _MS
+        from jobflow.core.store import MemoryStore as _MS  # alt path
         MemoryStore = _MS
     except Exception:
-        MemoryStore = None
+        try:
+            from jobflow.managers.base import MemoryStore as _MS  # very old path
+            MemoryStore = _MS
+        except Exception:
+            MemoryStore = None
+
+
+# ---- Last-resort store to avoid 'NoneType.connect' crashes (no persistence) ----
+class NoOpStore:
+    """Minimal stub with the methods run_locally() usually touches."""
+    def __init__(self): self._ok = False
+    def connect(self): self._ok = True
+    def close(self): pass
+    # methods below exist so jobflow doesn't explode if it calls them
+    def write_document(self, *a, **k): return None
+    def write_many(self, *a, **k): return None
+    def update(self, *a, **k): return None
+    def remove_docs(self, *a, **k): return None
+    def query_one(self, *a, **k): return None
+    def query(self, *a, **k): return []
+
+
+def _ensure_store() -> tuple[object, Optional[str]]:
+    """
+    Guarantee SETTINGS.JOB_STORE is a usable instance.
+    Returns (store, store_dir_if_filestore_else_None)
+    """
+    # Prefer an on-disk FileStore (best interop with many jobflow versions)
+    store_dir = None
+    try:
+        if FileStore is not None:
+            store_dir = os.path.abspath("./jobstore_local")
+            os.makedirs(store_dir, exist_ok=True)
+            store = FileStore(store_dir)
+            SETTINGS.JOB_STORE = store
+            return store, store_dir
+    except Exception:
+        store_dir = None
+
+    # Fall back to an in-memory store
+    try:
+        if MemoryStore is not None:
+            store = MemoryStore()
+            SETTINGS.JOB_STORE = store
+            return store, None
+    except Exception:
+        pass
+
+    # Final fallback: a no-op store that at least has connect()
+    store = NoOpStore()
+    SETTINGS.JOB_STORE = store
+    return store, None
 
 
 # ---------- utils ----------
@@ -150,15 +205,16 @@ def _props_from_any(d: Any) -> dict:
 
 
 def _extract_via_store(store, rs, flow_obj):
-    """Resolve flow and job outputs via a real store."""
+    """Resolve flow and job outputs via a real store (if it supports resolve)."""
     # Try flow.output first
     try:
-        resolved = flow_obj.output.resolve(store)
-        plain = _to_plain(resolved)
-        C = _maybe_tensor_anywhere(plain)
-        if C is not None:
-            P = _props_from_any(plain)
-            return np.array(C, float), P, {"found_in": {"scope": "flow.output.resolve(store)"}, "jobs_seen": []}, plain, []
+        if hasattr(flow_obj.output, "resolve"):
+            resolved = flow_obj.output.resolve(store)
+            plain = _to_plain(resolved)
+            C = _maybe_tensor_anywhere(plain)
+            if C is not None:
+                P = _props_from_any(plain)
+                return np.array(C, float), P, {"found_in": {"scope": "flow.output.resolve(store)"}, "jobs_seen": []}, plain, []
     except Exception:
         pass
 
@@ -169,7 +225,7 @@ def _extract_via_store(store, rs, flow_obj):
     for i, (jid, rec) in enumerate(items):
         jobs_seen.append({"id": str(jid), "name": getattr(rec, "name", None)})
         out_obj = getattr(rec, "output", None)
-        # Resolve if it's a reference
+
         try:
             if hasattr(out_obj, "resolve"):
                 out_resolved = out_obj.resolve(store)
@@ -234,7 +290,7 @@ def _render_payload(payload: dict):
     cA, cB, cC = st.columns(3)
     cA.metric("K_VRH (GPa)", f"{P.get('k_vrh', float('nan')):.3f}" if P.get("k_vrh") is not None else "—")
     cB.metric("G_VRH (GPa)", f"{P.get('g_vrh', float('nan')):.3f}" if P.get("g_vrh") is not None else "—")
-    cC.metric("E (GPa)",     f"{P.get('y_mod', float('nan')):.3f}" if P.get("y_mod") is not None else "—")
+    cC.metric("E (GPa)",     f"{P.get("y_mod", float('nan')):.3f}" if P.get("y_mod") is not None else "—")
 
     cD, cE = st.columns(2)
     po = P.get("homogeneous_poisson", None)
@@ -258,12 +314,9 @@ def elastic_tab(pmg_obj: Structure | None):
         return
 
     # State
-    if "elastic_running" not in st.session_state:
-        st.session_state.elastic_running = False
-    if "elastic_payload" not in st.session_state:
-        st.session_state.elastic_payload = None
-    if "elastic_debug" not in st.session_state:
-        st.session_state.elastic_debug = None
+    st.session_state.setdefault("elastic_running", False)
+    st.session_state.setdefault("elastic_payload", None)
+    st.session_state.setdefault("elastic_debug", None)
 
     disabled = st.session_state.elastic_running
 
@@ -301,31 +354,18 @@ def elastic_tab(pmg_obj: Structure | None):
         status = st.status("Building flow…", expanded=True)
         status.write("Preparing makers…")
 
+        # Ensure we have a usable store and make it the active default
+        store, store_dir = _ensure_store()
+
         bulk_relax = MACERelaxMaker(relax_cell=True,  relax_kwargs={"fmax": float(fmax)})
         el_relax   = MACERelaxMaker(relax_cell=bool(allow_cell), relax_kwargs={"fmax": float(fmax)})
         maker = ElasticMaker(bulk_relax_maker=bulk_relax, elastic_relax_maker=el_relax)
         flow = maker.make(structure=pmg_obj)
 
-        # Create a FileStore on disk (most compatible), falling back to MemoryStore
-        store = None
-        store_dir = "./jobstore_local"
-        os.makedirs(store_dir, exist_ok=True)
-        if FileStore is not None:
-            store = FileStore(os.path.abspath(store_dir))
-            SETTINGS.JOB_STORE = store  # set as active default
-        elif MemoryStore is not None:
-            store = MemoryStore()
-            SETTINGS.JOB_STORE = store  # set as active default
-        else:
-            SETTINGS.JOB_STORE = None  # no store available in this jobflow build
-
         status.update(label="Running locally…", state="running")
 
-        # IMPORTANT: only pass 'store=' if we actually have one
-        if store is not None:
-            rs = run_locally(flow, store=store, create_folders=True, ensure_success=True)
-        else:
-            rs = run_locally(flow, create_folders=True, ensure_success=True)
+        # Always pass the active store (prevents NoneType.connect crash)
+        rs = run_locally(flow, store=store, create_folders=True, ensure_success=True)
 
         # Quick job table
         rows = []
@@ -338,12 +378,12 @@ def elastic_tab(pmg_obj: Structure | None):
         status.update(label="Extracting results…", state="running")
 
         # 1) Try resolving via store API
-        got = _extract_via_store(store, rs, flow) if store is not None else None
+        got = _extract_via_store(store, rs, flow)
+        if not got and store_dir:
+            # 2) Filesystem fallback: scan JSON docs under the FileStore
+            got = _extract_via_files(store_dir)
         if not got:
-            # 2) Filesystem fallback: scan JSON docs under the FileStore (only if FileStore used)
-            got = _extract_via_files(store_dir if (store is not None and FileStore is not None) else None)
-        if not got:
-            # 3) As a last resort, deep-scan responses object (may be plain dicts in some builds)
+            # 3) As a last resort, deep-scan responses object (may be plain dicts)
             whole_plain = _to_plain(rs)
             C = _maybe_tensor_anywhere(whole_plain)
             if C is not None:
@@ -368,8 +408,8 @@ def elastic_tab(pmg_obj: Structure | None):
         st.session_state.elastic_debug = {
             "found_in": meta.get("found_in"),
             "jobs_seen": meta.get("jobs_seen"),
-            "store_kind": type(store).__name__ if store is not None else "None",
-            "store_dir": os.path.abspath(store_dir),
+            "store_kind": type(store).__name__,
+            "store_dir": store_dir,
         }
 
         status.update(label="Done ✅", state="complete")
@@ -379,11 +419,5 @@ def elastic_tab(pmg_obj: Structure | None):
         st.error(f"Elastic workflow failed: {e}")
         with st.expander("Exception", expanded=True):
             st.exception(e)
-        with st.expander("Hints", expanded=False):
-            st.write(
-                "If this persists, open the 'store_dir' from Debug info and look for JSON "
-                "files containing 'elastic_tensor' or a 6×6 array. This tab scans them "
-                "automatically when a FileStore is used."
-            )
     finally:
         st.session_state.elastic_running = False
