@@ -59,7 +59,8 @@ def _to_gpa(val: Any):
     if isinstance(val, dict):
         return {k: _to_gpa(v) for k, v in val.items()}
     arr = np.array(val, dtype=float)
-    if np.nanmax(np.abs(arr)) > 1e5:  # likely Pascals
+    # If it looks like Pascals, convert to GPa
+    if np.nanmax(np.abs(arr)) > 1e5:
         arr = arr * 1e-9
     if arr.ndim == 0:
         return float(arr)
@@ -116,13 +117,11 @@ def _maybe_tensor_anywhere(d: Any) -> Optional[List[List[float]]]:
         if _looks_like_6x6(x):
             return _to_gpa(x)
         if isinstance(x, dict):
-            # prioritize likely containers
             for sub in ("output", "data", "result", "results", "elastic_data", "elastic", "metadata"):
                 if sub in x:
                     got = walk(x[sub])
                     if got is not None:
                         return got
-            # then everything
             for v in x.values():
                 got = walk(v)
                 if got is not None:
@@ -142,7 +141,6 @@ def _props_from_any(d: Any) -> dict:
         for k in ("derived_properties", "properties"):
             if k in d and isinstance(d[k], dict):
                 return _to_gpa(d[k])
-        # search containers
         for sub in ("output", "data", "result", "results", "elastic_data", "elastic", "metadata"):
             if sub in d and isinstance(d[sub], dict):
                 got = _props_from_any(d[sub])
@@ -202,19 +200,15 @@ def _extract_via_store(store, rs, flow_obj):
 def _extract_via_files(store_dir: str):
     """
     Last-resort: scan the FileStore directory for JSON docs and pull a 6×6 tensor.
-    Works even if jobflow references aren't resolvable for this version combo.
     """
     if not store_dir or not os.path.isdir(store_dir):
         return None
-    # common Jobflow FileStore layout: JSON docs in subfolders; be permissive
     json_paths = []
     for pat in ("**/*.json", "*.json"):
         json_paths.extend(glob.glob(os.path.join(store_dir, pat), recursive=True))
-
-    # Prefer recently modified files
     json_paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
 
-    for p in json_paths[:200]:  # don't scan forever
+    for p in json_paths[:200]:
         try:
             with open(p, "r") as f:
                 data = json.load(f)
@@ -318,12 +312,20 @@ def elastic_tab(pmg_obj: Structure | None):
         os.makedirs(store_dir, exist_ok=True)
         if FileStore is not None:
             store = FileStore(os.path.abspath(store_dir))
+            SETTINGS.JOB_STORE = store  # set as active default
         elif MemoryStore is not None:
             store = MemoryStore()
-        SETTINGS.JOB_STORE = store  # set as active default
+            SETTINGS.JOB_STORE = store  # set as active default
+        else:
+            SETTINGS.JOB_STORE = None  # no store available in this jobflow build
 
         status.update(label="Running locally…", state="running")
-        rs = run_locally(flow, store=store, create_folders=True, ensure_success=True)
+
+        # IMPORTANT: only pass 'store=' if we actually have one
+        if store is not None:
+            rs = run_locally(flow, store=store, create_folders=True, ensure_success=True)
+        else:
+            rs = run_locally(flow, create_folders=True, ensure_success=True)
 
         # Quick job table
         rows = []
@@ -336,10 +338,17 @@ def elastic_tab(pmg_obj: Structure | None):
         status.update(label="Extracting results…", state="running")
 
         # 1) Try resolving via store API
-        got = _extract_via_store(store, rs, flow)
+        got = _extract_via_store(store, rs, flow) if store is not None else None
         if not got:
-            # 2) Filesystem fallback: scan JSON docs under the FileStore
-            got = _extract_via_files(store_dir if FileStore is not None else None)
+            # 2) Filesystem fallback: scan JSON docs under the FileStore (only if FileStore used)
+            got = _extract_via_files(store_dir if (store is not None and FileStore is not None) else None)
+        if not got:
+            # 3) As a last resort, deep-scan responses object (may be plain dicts in some builds)
+            whole_plain = _to_plain(rs)
+            C = _maybe_tensor_anywhere(whole_plain)
+            if C is not None:
+                P = _props_from_any(whole_plain)
+                got = (np.array(C, float), P, {"found_in": {"scope": "responses-deep-scan"}, "jobs_seen": []}, None, [])
 
         if not got:
             raise RuntimeError("Elastic results not found in job outputs.")
@@ -372,8 +381,9 @@ def elastic_tab(pmg_obj: Structure | None):
             st.exception(e)
         with st.expander("Hints", expanded=False):
             st.write(
-                "If this persists, check the JSONs under the store_dir shown in Debug info. "
-                "There should be one containing an 'elastic_tensor' or a 6×6 array."
+                "If this persists, open the 'store_dir' from Debug info and look for JSON "
+                "files containing 'elastic_tensor' or a 6×6 array. This tab scans them "
+                "automatically when a FileStore is used."
             )
     finally:
         st.session_state.elastic_running = False
