@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Optional, Tuple, List, Union
+from typing import Any, Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -52,40 +52,40 @@ def _is_6x6_numeric(x) -> bool:
 
 def _maybe_convert_to_gpa(C: np.ndarray) -> Tuple[np.ndarray, str]:
     C = np.array(C, dtype=float).reshape(6, 6)
-    # Typical GPa magnitudes are ~10–300; if much smaller, assume eV/Å^3
+    # Typical GPa magnitudes ~10–300; if much smaller, assume eV/Å^3
     if np.max(np.abs(C)) < 20.0:
         return C * EV_PER_ANG3_TO_GPA, "eV/Å³→GPa"
     return C, "GPa"
 
 def _cij_dict_to_matrix(d: dict) -> Optional[np.ndarray]:
     """
-    Accepts dicts like {'C11':..., 'C12':..., ..., 'C66':...} (case-insensitive),
-    fills symmetric 6x6 Voigt tensor.
+    Accept dicts like {'C11':..., 'C12':..., ..., 'C66':...} (case-insensitive),
+    fill symmetric 6x6 Voigt tensor.
     """
     if not isinstance(d, dict):
         return None
     D = {k.lower(): v for k, v in d.items()}
-    needed = [f"c{i}{j}" for i in range(1,7) for j in range(1,7) if i<=j]  # upper triangle keys
-    if not any(k in D for k in needed):
-        return None
-    C = np.zeros((6,6), float)
-    for i in range(1,7):
-        for j in range(i,7):
+    # accept upper triangle; missing entries remain 0
+    C = np.zeros((6, 6), float)
+    has_any = False
+    for i in range(1, 7):
+        for j in range(i, 7):
             key = f"c{i}{j}"
             if key in D:
-                C[i-1, j-1] = float(D[key])
-                C[j-1, i-1] = float(D[key])
-    # sanity: nonzero diagonal?
-    if not np.any(np.diag(C)):
+                val = float(D[key])
+                C[i-1, j-1] = val
+                C[j-1, i-1] = val
+                has_any = True
+    if not has_any or not np.any(np.diag(C)):
         return None
     return C
 
-def _triplet_list_to_matrix(lst: List[dict]) -> Optional[np.ndarray]:
+def _triplet_list_to_matrix(lst: List[Any]) -> Optional[np.ndarray]:
     """
-    Accepts list like [{'i':1,'j':2,'value':..}, ...] or [i,j,val] triplets.
+    Accept list like [{'i':1,'j':2,'value':..}, ...] or [i,j,val] triplets.
     """
     try:
-        C = np.zeros((6,6), float)
+        C = np.zeros((6, 6), float)
         filled = False
         for item in lst:
             if isinstance(item, dict):
@@ -119,37 +119,35 @@ def _extract_tensor_from_output_dict(out: dict) -> Tuple[Optional[np.ndarray], O
     Try multiple common locations/representations inside a job 'output' dict.
     Returns (C, path).
     """
-    # 1) Direct voigt array
     props = out.get("physical_properties") or {}
     candidates: List[Tuple[str, Any]] = [
         ("output.physical_properties.elastic_tensor_voigt", props.get("elastic_tensor_voigt")),
         ("output.elastic_tensor_voigt", out.get("elastic_tensor_voigt")),
     ]
-    # 2) nested 'elastic_tensor': {'voigt': [[...]]}
+    # nested elastic_tensor: {'voigt': [[...]]}
     et_props = props.get("elastic_tensor") if isinstance(props, dict) else None
     et_out = out.get("elastic_tensor") if isinstance(out, dict) else None
     candidates += [
         ("output.physical_properties.elastic_tensor.voigt", isinstance(et_props, dict) and et_props.get("voigt")),
         ("output.elastic_tensor.voigt", isinstance(et_out, dict) and et_out.get("voigt")),
     ]
-    # 3) C_ij synonyms
+    # C_ij synonyms
     candidates += [
         ("output.physical_properties.C_ij", props.get("C_ij")),
         ("output.C_ij", out.get("C_ij")),
     ]
-    # 4) dict of C11..C66
+    # dict-of-Cij or triplets first
     for label, obj in list(candidates):
         if isinstance(obj, dict):
             m = _cij_dict_to_matrix(obj)
             if m is not None:
                 return m, label
-    # 5) list of triplets
     for label, obj in list(candidates):
         if isinstance(obj, list):
             m = _triplet_list_to_matrix(obj)
             if m is not None:
                 return m, label
-    # 6) plain 6x6 anywhere among candidates
+    # plain 6x6
     for label, obj in candidates:
         if _is_6x6_numeric(obj):
             return np.array(obj, float).reshape(6, 6), label
@@ -158,13 +156,8 @@ def _extract_tensor_from_output_dict(out: dict) -> Tuple[Optional[np.ndarray], O
 def _deep_find_elastic(tree: Any) -> Tuple[Optional[np.ndarray], Optional[str]]:
     """
     Deep scan a nested dict/list for any recognizable elastic tensor form.
-    Order:
-      - known containers/keys
-      - 6x6 numeric array anywhere
-      - dict C11..C66
-      - list of triplets
     """
-    # First: check some likely containers quickly
+    # quick container checks
     if isinstance(tree, dict):
         for key in ("output", "result", "results", "data", "physical_properties"):
             node = tree.get(key)
@@ -172,14 +165,18 @@ def _deep_find_elastic(tree: Any) -> Tuple[Optional[np.ndarray], Optional[str]]:
                 C, where = _extract_tensor_from_output_dict(node if key == "output" else {"physical_properties": node})
                 if C is not None:
                     return C, f"rs.{key}.{where.split('.',1)[-1]}"
-                # direct keys inside container
+                # direct keys
                 for k in ("elastic_tensor_voigt", "C_ij", "elastic_tensor"):
                     v = node.get(k)
                     if v is not None:
                         if _is_6x6_numeric(v):
                             return np.array(v, float).reshape(6, 6), f"rs.{key}.{k}"
                         if isinstance(v, dict):
-                            m = _cij_dict_to_matrix(v) or _extract_tensor_from_output_dict({"elastic_tensor": v})[0]
+                            m = _cij_dict_to_matrix(v)
+                            if m is None and "voigt" in v:
+                                vv = v.get("voigt")
+                                if _is_6x6_numeric(vv):
+                                    m = np.array(vv, float).reshape(6, 6)
                             if m is not None:
                                 return m, f"rs.{key}.{k}"
                         if isinstance(v, list):
@@ -187,7 +184,7 @@ def _deep_find_elastic(tree: Any) -> Tuple[Optional[np.ndarray], Optional[str]]:
                             if m is not None:
                                 return m, f"rs.{key}.{k}"
 
-    # Full deep walk: prefer paths that mention 'elastic'
+    # deep walk
     array_hits: List[Tuple[str, np.ndarray]] = []
     dict_hits: List[Tuple[str, np.ndarray]] = []
     triplet_hits: List[Tuple[str, np.ndarray]] = []
@@ -198,10 +195,8 @@ def _deep_find_elastic(tree: Any) -> Tuple[Optional[np.ndarray], Optional[str]]:
             m = _cij_dict_to_matrix(v)
             if m is not None:
                 dict_hits.append((p, m))
-            else:
-                # nested 'voigt'
-                if "voigt" in v and _is_6x6_numeric(v.get("voigt")):
-                    dict_hits.append((p+".voigt", np.array(v["voigt"], float).reshape(6,6)))
+            elif "voigt" in v and _is_6x6_numeric(v.get("voigt")):
+                dict_hits.append((p + ".voigt", np.array(v["voigt"], float).reshape(6, 6)))
         elif isinstance(v, list):
             m = _triplet_list_to_matrix(v)
             if m is not None:
@@ -221,8 +216,7 @@ def _deep_find_elastic(tree: Any) -> Tuple[Optional[np.ndarray], Optional[str]]:
 
 def _query_elastic_from_store() -> Tuple[Optional[np.ndarray], Optional[str], Optional[dict]]:
     """
-    Pull latest doc from JobStore and deep-scan it entirely (not just output),
-    since schemas differ across versions.
+    Pull latest doc from JobStore and deep-scan it entirely.
     """
     store = SETTINGS.JOB_STORE
     if store is None:
@@ -236,7 +230,6 @@ def _query_elastic_from_store() -> Tuple[Optional[np.ndarray], Optional[str], Op
     last_doc = None
     for name in names:
         try:
-            # load the full doc to allow deep scan
             doc = store.query_one({"name": name}, properties=["*"], sort={"completed_at": -1}, load=True)
         except Exception:
             doc = None
@@ -286,6 +279,18 @@ def _render_elastic(C_raw: np.ndarray, where: Optional[str], show_where: bool):
         "elastic_constants.json",
     )
 
+# ------------------------ Torch dtype context (fixes CHGNet crash) ------------------------
+from contextlib import contextmanager
+
+@contextmanager
+def torch_default_dtype(temp_dtype: torch.dtype):
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(temp_dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(prev)
+
 # ------------------------ Main tab ------------------------
 def elastic_tab(pmg_obj: Structure | None):
     st.subheader("🪨 Elastic Constants — ML Force Field (read & default-run)")
@@ -296,13 +301,14 @@ def elastic_tab(pmg_obj: Structure | None):
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        precision = st.radio("Precision", ["float64 (recommended)", "float32 (fast)"], index=0, key="el_prec")
+        precision = st.radio("Global precision preference", ["float64 (recommended)", "float32 (fast)"], index=0, key="el_prec")
     with col2:
         show_where = st.toggle("Debug (show key path)", value=False)
     with col3:
         load_latest = st.button("Load Latest From JobStore", use_container_width=True)
 
-    # Precision (avoid MACE down-cast for relax/elastic)
+    # Respect user's global preference (MACE benefits from float64),
+    # but CHGNet run below will temporarily switch to float32 to avoid dtype crash.
     torch.set_default_dtype(torch.float64 if precision.startswith("float64") else torch.float32)
 
     # Show cached results across reruns
@@ -321,9 +327,9 @@ def elastic_tab(pmg_obj: Structure | None):
         return
 
     st.divider()
-    st.caption("Or run with default settings (same as before):")
+    st.caption("Or run with default settings (kept exactly like before):")
 
-    # ----- Default-run path (KEEP LIKE BEFORE) -----
+    # ----- Default-run path (no unsupported kwargs) -----
     run_btn = st.button("Run Elastic Workflow (default)", type="primary")
     if not run_btn:
         return
@@ -332,16 +338,19 @@ def elastic_tab(pmg_obj: Structure | None):
     try:
         steps.tick("Building workflow")
         try:
-            from atomate2.forcefields.flows.elastic import ElasticMaker  # no kwargs
+            # IMPORTANT: no unsupported kwargs here
+            from atomate2.forcefields.flows.elastic import ElasticMaker
         except Exception:
             st.error("ElasticMaker not found (atomate2.forcefields.flows.elastic). Please update atomate2.")
             return
 
-        maker = ElasticMaker()  # KEEP LIKE BEFORE (no unsupported kwargs)
-        flow = maker.make(structure=pmg_obj)
+        # CHGNet expects float32 internally; wrap the whole run to avoid dtype mismatch.
+        with torch_default_dtype(torch.float32):
+            maker = ElasticMaker()  # KEEP LIKE BEFORE (no max_strain / n_steps)
+            flow = maker.make(structure=pmg_obj)
 
-        steps.tick("Executing locally")
-        rs = run_locally(flow, create_folders=True, ensure_success=False)
+            steps.tick("Executing locally")
+            rs = run_locally(flow, create_folders=True, ensure_success=False)
 
         steps.tick("Querying JobStore")
         C, where, _doc = _query_elastic_from_store()
@@ -353,7 +362,7 @@ def elastic_tab(pmg_obj: Structure | None):
         if C is None:
             steps.finish(False)
             st.error("Elastic tensor not found in outputs. Turn on Debug to inspect paths.")
-            # Minimal peek to help diagnose (without spamming)
+            # Minimal peek to help diagnose
             if show_where:
                 plain = _to_plain(rs)
                 top_keys = list(plain.keys()) if isinstance(plain, dict) else [type(plain).__name__]
