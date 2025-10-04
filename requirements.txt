@@ -93,7 +93,7 @@ atomate2
 atomate2[phonons]
 atomate2[lobster]
 atomate2[forcefields]
-jobflow>=0.3.5
+jobflow
 
 # remove unused heavy extras (delete these three from your file if present):
 torchmetrics
