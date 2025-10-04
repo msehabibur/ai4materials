@@ -3,6 +3,10 @@ from __future__ import annotations
 
 import json
 import numbers
+import threading
+import time
+from typing import List, Optional
+
 import numpy as np
 import streamlit as st
 from monty.json import jsanitize
@@ -12,8 +16,7 @@ from jobflow import run_locally, SETTINGS
 from atomate2.forcefields.flows.elastic import ElasticMaker
 from atomate2.forcefields.jobs import MACERelaxMaker
 
-
-# -------------------- helpers --------------------
+# ==================== helpers ====================
 def _to_plain(obj):
     try:
         return jsanitize(obj, strict=False)
@@ -150,15 +153,76 @@ def _render_list_style(C_gpa: np.ndarray, P: dict):
     )
 
 
-# -------------------- main Streamlit tab --------------------
+# ==================== progress utilities ====================
+def _collect_job_uuids(flow) -> List[str]:
+    """Try to collect all job UUIDs from a flow before submission."""
+    uuids = []
+    try:
+        for j in flow.jobs:
+            if getattr(j, "uuid", None):
+                uuids.append(j.uuid)
+    except Exception:
+        pass
+    return uuids
+
+
+def _count_finished_jobs(store, uuids: List[str]) -> Optional[int]:
+    """Return number of finished jobs among uuids; None if querying fails."""
+    try:
+        store.connect()
+    except Exception:
+        # continue; many stores don't need explicit connect
+        pass
+
+    try:
+        # Prefer "state" if present; fall back to presence of completed_at
+        finished = 0
+        for u in uuids:
+            doc = store.query_one(
+                {"uuid": u},
+                properties=["state", "completed_at"],
+                load=False,
+                sort={"completed_at": -1},
+            )
+            if not doc:
+                continue
+            state = doc.get("state")
+            if state in ("COMPLETED", "FAILED"):
+                finished += 1
+            elif doc.get("completed_at"):
+                finished += 1
+        return finished
+    except Exception:
+        return None
+
+
+def _run_flow_worker(flow, kwargs: dict):
+    """Worker thread to execute the flow."""
+    try:
+        rs = run_locally(flow, **kwargs)
+        st.session_state["elastic_rs_plain"] = _to_plain(rs)
+        st.session_state["elastic_error"] = None
+    except Exception as e:
+        st.session_state["elastic_error"] = e
+    finally:
+        st.session_state["elastic_running"] = False
+
+
+# ==================== main Streamlit tab ====================
 def elastic_tab(pmg_obj: Structure | None):
     st.subheader("🧱 Elastic — MACE (list output)")
+
     if pmg_obj is None:
         st.info("Upload/select a structure in the Viewer first.")
         return
 
+    # session state keys
     st.session_state.setdefault("elastic_running", False)
     st.session_state.setdefault("elastic_payload", None)
+    st.session_state.setdefault("elastic_job_uuids", [])
+    st.session_state.setdefault("elastic_total_jobs", 0)
+    st.session_state.setdefault("elastic_rs_plain", None)
+    st.session_state.setdefault("elastic_error", None)
 
     disabled = st.session_state["elastic_running"]
     c1, c2 = st.columns(2)
@@ -178,82 +242,131 @@ def elastic_tab(pmg_obj: Structure | None):
 
     run_btn = st.button("Run Elastic Workflow", type="primary", disabled=disabled)
 
-    # Show any cached results in list style
+    # Show any cached results
     if (not st.session_state["elastic_running"]) and st.session_state["elastic_payload"]:
         C_gpa = np.array(st.session_state["elastic_payload"]["C_GPa"], dtype=float)
         P     = st.session_state["elastic_payload"]["props"]
         _render_list_style(C_gpa, P)
 
-    if (not run_btn) or st.session_state["elastic_running"]:
-        return
+    # ===== Kick off run (once) =====
+    if run_btn and (not st.session_state["elastic_running"]):
+        st.session_state["elastic_running"] = True
+        st.session_state["elastic_rs_plain"] = None
+        st.session_state["elastic_error"] = None
 
-    # ===== Run once =====
-    st.session_state["elastic_running"] = True
-    try:
-        # Build flow (MACE on both relaxes)
+        # Build flow
         bulk_relax = MACERelaxMaker(relax_cell=True,  relax_kwargs={"fmax": float(fmax)})
         el_relax   = MACERelaxMaker(relax_cell=bool(allow_cell), relax_kwargs={"fmax": float(fmax)})
         maker = ElasticMaker(bulk_relax_maker=bulk_relax, elastic_relax_maker=el_relax)
         flow = maker.make(structure=pmg_obj)
 
-        # Follow the reliable pattern: no explicit store arg; use SETTINGS.JOB_STORE afterwards
-        rs = run_locally(flow, create_folders=True, ensure_success=False)
+        # collect uuids for progress tracking
+        uuids = _collect_job_uuids(flow)
+        st.session_state["elastic_job_uuids"] = uuids
+        st.session_state["elastic_total_jobs"] = len(uuids) if uuids else 0
 
-        # Extract via Jobflow store (fit_elastic_tensor)
-        store = SETTINGS.JOB_STORE
-        if store is None:
-            raise RuntimeError("SETTINGS.JOB_STORE is None after run_locally; cannot query results.")
-        try:
-            store.connect()
-        except Exception:
-            pass
-
-        doc = store.query_one(
-            {"name": "fit_elastic_tensor"},
-            properties=["output.elastic_tensor", "output.derived_properties"],
-            load=True,
-            sort={"completed_at": -1},
+        # launch worker thread
+        t = threading.Thread(
+            target=_run_flow_worker,
+            args=(flow, dict(create_folders=True, ensure_success=False)),
+            daemon=True,
         )
+        t.start()
 
-        if doc is None:
-            # fallback: deep-scan responses
-            plain = _to_plain(rs)
-            C_raw = _find_tensor_anywhere(plain)
-            if C_raw is None:
-                raise RuntimeError("No 'fit_elastic_tensor' document and no 6×6 tensor in responses.")
-            P = {}
+    # ===== While running: show progress =====
+    if st.session_state["elastic_running"]:
+        store = SETTINGS.JOB_STORE
+        progress_area = st.empty()
+        note_area = st.empty()
+
+        # If we know total jobs, use a true progress bar; else spinner fallback.
+        total = st.session_state.get("elastic_total_jobs", 0)
+        if total:
+            pb = progress_area.progress(0, text="Submitting jobs…")
+            last = -1
+            while st.session_state["elastic_running"]:
+                finished = _count_finished_jobs(store, st.session_state["elastic_job_uuids"])
+                if finished is None:
+                    # store can't be queried -> fallback to spinner
+                    break
+                finished = int(finished)
+                if finished != last:
+                    frac = max(0.0, min(1.0, finished / total))
+                    pb.progress(int(frac * 100), text=f"Running elastic workflow… {finished}/{total} finished")
+                    note_area.info("Tracking job completion from the JobStore…")
+                    last = finished
+                time.sleep(1.0)
+            progress_area.empty()
+            note_area.empty()
         else:
-            out = doc.get("output", {}) if isinstance(doc, dict) else {}
-            et  = out.get("elastic_tensor", {}) if isinstance(out, dict) else {}
-            C_raw = _pick_c_6x6(et)
-            if C_raw is None:
-                raise RuntimeError("Elastic tensor found, but no 6×6 field among ieee_format/voigt/matrix/C_ij/C.")
-            P = out.get("derived_properties", {}) or {}
+            # Unknown job count; show an indeterminate spinner
+            with st.spinner("Running elastic workflow…"):
+                while st.session_state["elastic_running"]:
+                    time.sleep(1.0)
 
-        # ---- Normalize units & recompute E, ν in GPa (override any stale Pa values) ----
-        C_gpa = _as_gpa_array(C_raw)        # tensor → GPa
-        P     = _props_to_gpa(P)            # properties → GPa if needed
+        # When the worker finishes, continue below to extract results.
 
-        K = P.get("k_vrh")
-        G = P.get("g_vrh")
-        if isinstance(K, (int, float)) and isinstance(G, (int, float)):
-            denom = 3.0 * K + G
-            if denom != 0.0:
-                P["y_mod"] = 9.0 * K * G / denom                # E in GPa
-                P["homogeneous_poisson"] = (3.0 * K - 2.0 * G) / (2.0 * denom)
-        else:
-            # if only y_mod present and suspiciously large, convert to GPa
-            y = P.get("y_mod")
-            if isinstance(y, (int, float)) and abs(y) > 1e5:
-                P["y_mod"] = y * 1e-9
+    # ===== After run finishes: extract & render =====
+    if (not st.session_state["elastic_running"]) and (st.session_state["elastic_rs_plain"] or st.session_state["elastic_error"]):
+        if st.session_state["elastic_error"] is not None:
+            e = st.session_state["elastic_error"]
+            st.error(f"Elastic workflow failed: {e}")
+            with st.expander("Exception", expanded=True):
+                st.exception(e)
+            return
 
-        # Persist + render (list style)
-        st.session_state["elastic_payload"] = {"C_GPa": C_gpa.tolist(), "props": P}
-        _render_list_style(C_gpa, P)
+        try:
+            # Prefer querying the 'fit_elastic_tensor' document
+            store = SETTINGS.JOB_STORE
+            if store is None:
+                raise RuntimeError("SETTINGS.JOB_STORE is None after run; cannot query results.")
+            try:
+                store.connect()
+            except Exception:
+                pass
 
-    except Exception as e:
-        st.error(f"Elastic workflow failed: {e}")
-        with st.expander("Exception", expanded=True):
-            st.exception(e)
-    finally:
-        st.session_state["elastic_running"] = False
+            doc = store.query_one(
+                {"name": "fit_elastic_tensor"},
+                properties=["output.elastic_tensor", "output.derived_properties"],
+                load=True,
+                sort={"completed_at": -1},
+            )
+
+            if doc is None:
+                # fallback: deep-scan responses
+                plain = st.session_state["elastic_rs_plain"]
+                C_raw = _find_tensor_anywhere(plain)
+                if C_raw is None:
+                    raise RuntimeError("No 'fit_elastic_tensor' document and no 6×6 tensor in responses.")
+                P = {}
+            else:
+                out = doc.get("output", {}) if isinstance(doc, dict) else {}
+                et  = out.get("elastic_tensor", {}) if isinstance(out, dict) else {}
+                C_raw = _pick_c_6x6(et)
+                if C_raw is None:
+                    raise RuntimeError("Elastic tensor found, but no 6×6 field among ieee_format/voigt/matrix/C_ij/C.")
+                P = out.get("derived_properties", {}) or {}
+
+            # Units normalization & derived values in GPa
+            C_gpa = _as_gpa_array(C_raw)
+            P     = _props_to_gpa(P)
+
+            K = P.get("k_vrh")
+            G = P.get("g_vrh")
+            if isinstance(K, (int, float)) and isinstance(G, (int, float)):
+                denom = 3.0 * K + G
+                if denom != 0.0:
+                    P["y_mod"] = 9.0 * K * G / denom
+                    P["homogeneous_poisson"] = (3.0 * K - 2.0 * G) / (2.0 * denom)
+            else:
+                y = P.get("y_mod")
+                if isinstance(y, (int, float)) and abs(y) > 1e5:
+                    P["y_mod"] = y * 1e-9
+
+            st.session_state["elastic_payload"] = {"C_GPa": C_gpa.tolist(), "props": P}
+            _render_list_style(C_gpa, P)
+
+        except Exception as e:
+            st.error(f"Elastic workflow finished but result extraction failed: {e}")
+            with st.expander("Exception", expanded=True):
+                st.exception(e)
