@@ -2,387 +2,258 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Optional, Tuple, List
-
+import numbers
 import numpy as np
-import pandas as pd
 import streamlit as st
-import torch
-
-from jobflow import run_locally, SETTINGS
 from monty.json import jsanitize
 from pymatgen.core import Structure
-from pymatgen.analysis.elasticity.elastic import ElasticTensor
 
-EV_PER_ANG3_TO_GPA = 160.21766208
+from jobflow import run_locally, SETTINGS
+from atomate2.forcefields.flows.elastic import ElasticMaker
+from atomate2.forcefields.jobs import MACERelaxMaker
 
-# ------------------------ Progress ------------------------
-class _StepProgress:
-    def __init__(self, total_steps: int, label: str = "Working…"):
-        self.total = max(int(total_steps), 1)
-        self.curr = 0
-        self._pct = st.empty()
-        self._status = st.empty()
-        self._bar = st.progress(0, text=label)
 
-    def tick(self, msg: str):
-        self.curr = min(self.curr + 1, self.total)
-        pct = int(self.curr / self.total * 100)
-        self._status.write(f"**{msg}**")
-        self._bar.progress(pct)
-        self._pct.caption(f"{self.curr}/{self.total} steps")
-
-    def finish(self, ok: bool = True):
-        if ok:
-            self._bar.progress(100, text="Done")
-
-# ------------------------ Utils ------------------------
-def _to_plain(x):
+# -------------------- helpers --------------------
+def _to_plain(obj):
     try:
-        return jsanitize(x, strict=False)
+        return jsanitize(obj, strict=False)
     except Exception:
-        return x
+        if hasattr(obj, "as_dict"):
+            try:
+                return jsanitize(obj.as_dict(), strict=False)
+            except Exception:
+                return obj
+        return obj
 
-def _is_6x6_numeric(x) -> bool:
+
+def _looks_like_6x6(mat):
+    if isinstance(mat, (list, tuple)) and len(mat) == 6:
+        for row in mat:
+            if not isinstance(row, (list, tuple)) or len(row) != 6:
+                return False
+            for x in row:
+                if not isinstance(x, numbers.Number):
+                    return False
+        return True
+    return False
+
+
+def _as_gpa_array(x):
+    """Convert Pa→GPa if needed, return ndarray in GPa."""
+    arr = np.array(x, dtype=float)
     try:
-        a = np.array(x, dtype=float)
-        return a.shape == (6, 6) and np.isfinite(a).all()
-    except Exception:
-        return False
-
-def _maybe_convert_to_gpa(C: np.ndarray) -> Tuple[np.ndarray, str]:
-    C = np.array(C, dtype=float).reshape(6, 6)
-    # Typical GPa magnitudes ~10–300; if much smaller, assume eV/Å^3
-    if np.max(np.abs(C)) < 20.0:
-        return C * EV_PER_ANG3_TO_GPA, "eV/Å³→GPa"
-    return C, "GPa"
-
-def _cij_dict_to_matrix(d: dict) -> Optional[np.ndarray]:
-    """
-    Accept dicts like {'C11':..., 'C12':..., ..., 'C66':...} (case-insensitive),
-    fill symmetric 6x6 Voigt tensor.
-    """
-    if not isinstance(d, dict):
-        return None
-    D = {k.lower(): v for k, v in d.items()}
-    # accept upper triangle; missing entries remain 0
-    C = np.zeros((6, 6), float)
-    has_any = False
-    for i in range(1, 7):
-        for j in range(i, 7):
-            key = f"c{i}{j}"
-            if key in D:
-                val = float(D[key])
-                C[i-1, j-1] = val
-                C[j-1, i-1] = val
-                has_any = True
-    if not has_any or not np.any(np.diag(C)):
-        return None
-    return C
-
-def _triplet_list_to_matrix(lst: List[Any]) -> Optional[np.ndarray]:
-    """
-    Accept list like [{'i':1,'j':2,'value':..}, ...] or [i,j,val] triplets.
-    """
-    try:
-        C = np.zeros((6, 6), float)
-        filled = False
-        for item in lst:
-            if isinstance(item, dict):
-                i, j, v = int(item["i"]), int(item["j"]), float(item["value"])
-            elif isinstance(item, (list, tuple)) and len(item) >= 3:
-                i, j, v = int(item[0]), int(item[1]), float(item[2])
-            else:
-                continue
-            if 1 <= i <= 6 and 1 <= j <= 6:
-                C[i-1, j-1] = v
-                C[j-1, i-1] = v
-                filled = True
-        if filled:
-            return C
+        if np.nanmax(np.abs(arr)) > 1e5:  # likely Pascals
+            arr *= 1e-9
     except Exception:
         pass
+    return arr
+
+
+def _props_to_gpa(props: dict) -> dict:
+    """Scalar props Pa→GPa when needed."""
+    if not isinstance(props, dict):
+        return {}
+    out = {}
+    for k, v in props.items():
+        if isinstance(v, (int, float)):
+            vv = float(v)
+            if abs(vv) > 1e5:  # likely Pa
+                vv *= 1e-9
+            out[k] = vv
+        else:
+            out[k] = v
+    return out
+
+
+def _pick_c_6x6(elastic_tensor_obj: dict):
+    """Choose a 6×6 matrix from common field names."""
+    if not isinstance(elastic_tensor_obj, dict):
+        return None
+    for key in ("ieee_format", "voigt", "matrix", "C_ij", "C"):
+        if key in elastic_tensor_obj and _looks_like_6x6(elastic_tensor_obj[key]):
+            return elastic_tensor_obj[key]
     return None
 
-def _walk_paths(tree: Any, path: str = "$"):
-    if isinstance(tree, dict):
-        for k, v in tree.items():
-            yield from _walk_paths(v, f"{path}.{k}")
-    elif isinstance(tree, (list, tuple)):
-        for i, v in enumerate(tree):
-            yield from _walk_paths(v, f"{path}[{i}]")
-    else:
-        yield (path, tree)
 
-def _extract_tensor_from_output_dict(out: dict) -> Tuple[Optional[np.ndarray], Optional[str]]:
-    """
-    Try multiple common locations/representations inside a job 'output' dict.
-    Returns (C, path).
-    """
-    props = out.get("physical_properties") or {}
-    candidates: List[Tuple[str, Any]] = [
-        ("output.physical_properties.elastic_tensor_voigt", props.get("elastic_tensor_voigt")),
-        ("output.elastic_tensor_voigt", out.get("elastic_tensor_voigt")),
-    ]
-    # nested elastic_tensor: {'voigt': [[...]]}
-    et_props = props.get("elastic_tensor") if isinstance(props, dict) else None
-    et_out = out.get("elastic_tensor") if isinstance(out, dict) else None
-    candidates += [
-        ("output.physical_properties.elastic_tensor.voigt", isinstance(et_props, dict) and et_props.get("voigt")),
-        ("output.elastic_tensor.voigt", isinstance(et_out, dict) and et_out.get("voigt")),
-    ]
-    # C_ij synonyms
-    candidates += [
-        ("output.physical_properties.C_ij", props.get("C_ij")),
-        ("output.C_ij", out.get("C_ij")),
-    ]
-    # dict-of-Cij or triplets first
-    for label, obj in list(candidates):
-        if isinstance(obj, dict):
-            m = _cij_dict_to_matrix(obj)
-            if m is not None:
-                return m, label
-    for label, obj in list(candidates):
-        if isinstance(obj, list):
-            m = _triplet_list_to_matrix(obj)
-            if m is not None:
-                return m, label
-    # plain 6x6
-    for label, obj in candidates:
-        if _is_6x6_numeric(obj):
-            return np.array(obj, float).reshape(6, 6), label
-    return None, None
+def _find_tensor_anywhere(d):
+    """Fallback deep-search for a 6×6 matrix in nested dict/list."""
+    def walk(x):
+        if _looks_like_6x6(x):
+            return x
+        if isinstance(x, dict):
+            # try likely keys first
+            for k in ("elastic_tensor", "tensor", "C_ij", "C", "voigt", "ieee_format",
+                      "output", "data", "results", "result", "metadata"):
+                if k in x:
+                    got = walk(x[k])
+                    if got is not None:
+                        return got
+            for v in x.values():
+                got = walk(v)
+                if got is not None:
+                    return got
+        elif isinstance(x, (list, tuple)):
+            for v in x:
+                got = walk(v)
+                if got is not None:
+                    return got
+        return None
+    return walk(d)
 
-def _deep_find_elastic(tree: Any) -> Tuple[Optional[np.ndarray], Optional[str]]:
-    """
-    Deep scan a nested dict/list for any recognizable elastic tensor form.
-    """
-    # quick container checks
-    if isinstance(tree, dict):
-        for key in ("output", "result", "results", "data", "physical_properties"):
-            node = tree.get(key)
-            if isinstance(node, dict):
-                C, where = _extract_tensor_from_output_dict(node if key == "output" else {"physical_properties": node})
-                if C is not None:
-                    return C, f"rs.{key}.{where.split('.',1)[-1]}"
-                # direct keys
-                for k in ("elastic_tensor_voigt", "C_ij", "elastic_tensor"):
-                    v = node.get(k)
-                    if v is not None:
-                        if _is_6x6_numeric(v):
-                            return np.array(v, float).reshape(6, 6), f"rs.{key}.{k}"
-                        if isinstance(v, dict):
-                            m = _cij_dict_to_matrix(v)
-                            if m is None and "voigt" in v:
-                                vv = v.get("voigt")
-                                if _is_6x6_numeric(vv):
-                                    m = np.array(vv, float).reshape(6, 6)
-                            if m is not None:
-                                return m, f"rs.{key}.{k}"
-                        if isinstance(v, list):
-                            m = _triplet_list_to_matrix(v)
-                            if m is not None:
-                                return m, f"rs.{key}.{k}"
 
-    # deep walk
-    array_hits: List[Tuple[str, np.ndarray]] = []
-    dict_hits: List[Tuple[str, np.ndarray]] = []
-    triplet_hits: List[Tuple[str, np.ndarray]] = []
-    for p, v in _walk_paths(tree):
-        if _is_6x6_numeric(v):
-            array_hits.append((p, np.array(v, float).reshape(6, 6)))
-        elif isinstance(v, dict):
-            m = _cij_dict_to_matrix(v)
-            if m is not None:
-                dict_hits.append((p, m))
-            elif "voigt" in v and _is_6x6_numeric(v.get("voigt")):
-                dict_hits.append((p + ".voigt", np.array(v["voigt"], float).reshape(6, 6)))
-        elif isinstance(v, list):
-            m = _triplet_list_to_matrix(v)
-            if m is not None:
-                triplet_hits.append((p, m))
+def _format_list_of_lists(arr):
+    """Pretty print a 6×6 list-of-lists as Python-style text."""
+    A = np.array(arr, dtype=float)
+    lines = ["["]
+    for i, row in enumerate(A):
+        row_txt = ", ".join(f"{v:.6f}" for v in row)
+        if i < len(A) - 1:
+            lines.append(f"  [{row_txt}],")
+        else:
+            lines.append(f"  [{row_txt}]")
+    lines.append("]")
+    return "\n".join(lines)
 
-    def _best(hits: List[Tuple[str, np.ndarray]]) -> Optional[Tuple[str, np.ndarray]]:
-        if not hits:
-            return None
-        hits.sort(key=lambda t: ("elastic" not in t[0].lower(), len(t[0])))
-        return hits[0]
 
-    for bag in (dict_hits, triplet_hits, array_hits):
-        best = _best(bag)
-        if best:
-            return best[1], best[0]
-    return None, None
+def _render_list_style(C_gpa: np.ndarray, P: dict):
+    """Show C_ij and properties as list-style text (no tables/heatmaps)."""
+    st.markdown("### Elastic results (list style)")
+    st.markdown("**C_ij (GPa), 6×6 (Voigt/IEEE)**")
+    st.code(_format_list_of_lists(C_gpa), language="python")
 
-def _query_elastic_from_store() -> Tuple[Optional[np.ndarray], Optional[str], Optional[dict]]:
-    """
-    Pull latest doc from JobStore and deep-scan it entirely.
-    """
-    store = SETTINGS.JOB_STORE
-    if store is None:
-        return None, None, None
-    try:
-        store.connect()
-    except Exception:
-        return None, None, None
+    # Bullet list of key properties
+    k = P.get("k_vrh"); g = P.get("g_vrh"); e = P.get("y_mod")
+    nu = P.get("homogeneous_poisson")
+    au = P.get("universal_anisotropy")
 
-    names = ("fit_elastic_tensor", "elastic_fit", "get_elastic_tensor")
-    last_doc = None
-    for name in names:
-        try:
-            doc = store.query_one({"name": name}, properties=["*"], sort={"completed_at": -1}, load=True)
-        except Exception:
-            doc = None
-        if isinstance(doc, dict):
-            last_doc = doc
-            C, where = _deep_find_elastic(doc)
-            if C is not None:
-                return C, f"JobStore:{name}:{where or 'full_doc'}", doc
-    return None, None, last_doc
+    bullets = []
+    bullets.append(f"- K_VRH (GPa): {k:.3f}" if isinstance(k, (int, float)) else "- K_VRH (GPa): —")
+    bullets.append(f"- G_VRH (GPa): {g:.3f}" if isinstance(g, (int, float)) else "- G_VRH (GPa): —")
+    bullets.append(f"- E (GPa): {e:.3f}" if isinstance(e, (int, float)) else "- E (GPa): —")
+    bullets.append(f"- Poisson ν: {nu:.3f}" if isinstance(nu, (int, float)) else "- Poisson ν: —")
+    bullets.append(f"- Anisotropy AU: {au:.3f}" if isinstance(au, (int, float)) else "- Anisotropy AU: —")
 
-def _render_elastic(C_raw: np.ndarray, where: Optional[str], show_where: bool):
-    C_gpa, conv = _maybe_convert_to_gpa(C_raw)
-    et = ElasticTensor.from_voigt(C_gpa)
+    st.markdown("\n".join(bullets))
 
-    if show_where and where:
-        st.caption(f"Found elastic tensor at: `{where}` (conversion: {conv})")
-
-    st.subheader("Elastic constants (Voigt 6×6, GPa)")
-    df = pd.DataFrame(
-        C_gpa,
-        index=[f"C{i+1}*" for i in range(6)],
-        columns=[f"*{j+1}" for j in range(6)],
-    )
-    st.dataframe(df.style.format("{:.2f}"), use_container_width=True)
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Bulk (K_VRH)", f"{et.k_vrh:.2f} GPa")
-    c2.metric("Shear (G_VRH)", f"{et.g_vrh:.2f} GPa")
-    c3.metric("Young’s (E)", f"{et.y_modulus:.2f} GPa")
-    c4.metric("Poisson (ν)", f"{et.poisson_ratio:.3f}")
-    c5.metric("Anisotropy (Aᵁ)", f"{et.universal_anisotropy:.2f}")
-
+    # Also provide a JSON download for scripting if needed
     payload = {
-        "units": "GPa",
-        "C_voigt": C_gpa.tolist(),
-        "unit_conversion": conv,
-        "K_VRH": float(et.k_vrh),
-        "G_VRH": float(et.g_vrh),
-        "E_VRH": float(et.y_modulus),
-        "nu": float(et.poisson_ratio),
-        "A_U": float(et.universal_anisotropy),
-        "source_path": where or "",
+        "elastic_tensor_GPa": np.array(C_gpa, dtype=float).tolist(),
+        "derived_properties_GPa": {
+            k2: (float(v2) if isinstance(v2, (int, float)) else v2) for k2, v2 in P.items()
+        },
     }
     st.download_button(
-        "⬇️ Elastic constants (JSON)",
-        json.dumps(payload, indent=2).encode(),
-        "elastic_constants.json",
+        "⬇️ Download results (JSON)",
+        json.dumps(payload, indent=2).encode("utf-8"),
+        "elastic_results.json",
+        mime="application/json",
     )
 
-# ------------------------ Torch dtype context (fixes CHGNet crash) ------------------------
-from contextlib import contextmanager
 
-@contextmanager
-def torch_default_dtype(temp_dtype: torch.dtype):
-    prev = torch.get_default_dtype()
-    torch.set_default_dtype(temp_dtype)
-    try:
-        yield
-    finally:
-        torch.set_default_dtype(prev)
-
-# ------------------------ Main tab ------------------------
+# -------------------- main Streamlit tab --------------------
 def elastic_tab(pmg_obj: Structure | None):
-    st.subheader("🪨 Elastic Constants — ML Force Field (read & default-run)")
-
+    st.subheader("🧱 Elastic — MACE (list output)")
     if pmg_obj is None:
-        st.info("Upload/select a structure in the Viewer to compute elastic constants.")
+        st.info("Upload/select a structure in the Viewer first.")
         return
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        precision = st.radio("Global precision preference", ["float64 (recommended)", "float32 (fast)"], index=0, key="el_prec")
-    with col2:
-        show_where = st.toggle("Debug (show key path)", value=False)
-    with col3:
-        load_latest = st.button("Load Latest From JobStore", use_container_width=True)
+    st.session_state.setdefault("elastic_running", False)
+    st.session_state.setdefault("elastic_payload", None)
 
-    # Respect user's global preference (MACE benefits from float64),
-    # but CHGNet run below will temporarily switch to float32 to avoid dtype crash.
-    torch.set_default_dtype(torch.float64 if precision.startswith("float64") else torch.float32)
+    disabled = st.session_state["elastic_running"]
+    c1, c2 = st.columns(2)
+    with c1:
+        fmax = st.number_input(
+            "Relax fmax (eV/Å)",
+            min_value=1e-8, max_value=1e-1,
+            value=1e-5, step=1e-8, format="%.0e",
+            disabled=disabled,
+        )
+    with c2:
+        allow_cell = st.selectbox(
+            "Relax cell?",
+            ["Yes (recommended)", "No (fixed cell)"],
+            index=0, disabled=disabled
+        ).startswith("Yes")
 
-    # Show cached results across reruns
-    if "elastic_C_cached" in st.session_state:
-        _render_elastic(st.session_state["elastic_C_cached"], st.session_state.get("elastic_where"), show_where)
+    run_btn = st.button("Run Elastic Workflow", type="primary", disabled=disabled)
 
-    # ----- Reader-only path -----
-    if load_latest:
-        C, where, _doc = _query_elastic_from_store()
-        if C is None:
-            st.error("No elastic tensor found in JobStore. Make sure the elastic workflow wrote results to the store.")
-            return
-        st.session_state["elastic_C_cached"] = C
-        st.session_state["elastic_where"] = where
-        _render_elastic(C, where, show_where)
+    # Show any cached results in list style
+    if (not st.session_state["elastic_running"]) and st.session_state["elastic_payload"]:
+        C_gpa = np.array(st.session_state["elastic_payload"]["C_GPa"], dtype=float)
+        P     = st.session_state["elastic_payload"]["props"]
+        _render_list_style(C_gpa, P)
+
+    if (not run_btn) or st.session_state["elastic_running"]:
         return
 
-    st.divider()
-    st.caption("Or run with default settings (kept exactly like before):")
-
-    # ----- Default-run path (no unsupported kwargs) -----
-    run_btn = st.button("Run Elastic Workflow (default)", type="primary")
-    if not run_btn:
-        return
-
-    steps = _StepProgress(6, "Elastic workflow running…")
+    # ===== Run once =====
+    st.session_state["elastic_running"] = True
     try:
-        steps.tick("Building workflow")
+        # Build flow (MACE on both relaxes)
+        bulk_relax = MACERelaxMaker(relax_cell=True,  relax_kwargs={"fmax": float(fmax)})
+        el_relax   = MACERelaxMaker(relax_cell=bool(allow_cell), relax_kwargs={"fmax": float(fmax)})
+        maker = ElasticMaker(bulk_relax_maker=bulk_relax, elastic_relax_maker=el_relax)
+        flow = maker.make(structure=pmg_obj)
+
+        # Follow the reliable pattern: no explicit store arg; use SETTINGS.JOB_STORE afterwards
+        rs = run_locally(flow, create_folders=True, ensure_success=False)
+
+        # Extract via Jobflow store (fit_elastic_tensor)
+        store = SETTINGS.JOB_STORE
+        if store is None:
+            raise RuntimeError("SETTINGS.JOB_STORE is None after run_locally; cannot query results.")
         try:
-            # IMPORTANT: no unsupported kwargs here
-            from atomate2.forcefields.flows.elastic import ElasticMaker
+            store.connect()
         except Exception:
-            st.error("ElasticMaker not found (atomate2.forcefields.flows.elastic). Please update atomate2.")
-            return
+            pass
 
-        # CHGNet expects float32 internally; wrap the whole run to avoid dtype mismatch.
-        with torch_default_dtype(torch.float32):
-            maker = ElasticMaker()  # KEEP LIKE BEFORE (no max_strain / n_steps)
-            flow = maker.make(structure=pmg_obj)
+        doc = store.query_one(
+            {"name": "fit_elastic_tensor"},
+            properties=["output.elastic_tensor", "output.derived_properties"],
+            load=True,
+            sort={"completed_at": -1},
+        )
 
-            steps.tick("Executing locally")
-            rs = run_locally(flow, create_folders=True, ensure_success=False)
+        if doc is None:
+            # fallback: deep-scan responses
+            plain = _to_plain(rs)
+            C_raw = _find_tensor_anywhere(plain)
+            if C_raw is None:
+                raise RuntimeError("No 'fit_elastic_tensor' document and no 6×6 tensor in responses.")
+            P = {}
+        else:
+            out = doc.get("output", {}) if isinstance(doc, dict) else {}
+            et  = out.get("elastic_tensor", {}) if isinstance(out, dict) else {}
+            C_raw = _pick_c_6x6(et)
+            if C_raw is None:
+                raise RuntimeError("Elastic tensor found, but no 6×6 field among ieee_format/voigt/matrix/C_ij/C.")
+            P = out.get("derived_properties", {}) or {}
 
-        steps.tick("Querying JobStore")
-        C, where, _doc = _query_elastic_from_store()
+        # ---- Normalize units & recompute E, ν in GPa (override any stale Pa values) ----
+        C_gpa = _as_gpa_array(C_raw)        # tensor → GPa
+        P     = _props_to_gpa(P)            # properties → GPa if needed
 
-        if C is None:
-            steps.tick("Scanning in-memory results")
-            C, where = _deep_find_elastic(_to_plain(rs))
+        K = P.get("k_vrh")
+        G = P.get("g_vrh")
+        if isinstance(K, (int, float)) and isinstance(G, (int, float)):
+            denom = 3.0 * K + G
+            if denom != 0.0:
+                P["y_mod"] = 9.0 * K * G / denom                # E in GPa
+                P["homogeneous_poisson"] = (3.0 * K - 2.0 * G) / (2.0 * denom)
+        else:
+            # if only y_mod present and suspiciously large, convert to GPa
+            y = P.get("y_mod")
+            if isinstance(y, (int, float)) and abs(y) > 1e5:
+                P["y_mod"] = y * 1e-9
 
-        if C is None:
-            steps.finish(False)
-            st.error("Elastic tensor not found in outputs. Turn on Debug to inspect paths.")
-            # Minimal peek to help diagnose
-            if show_where:
-                plain = _to_plain(rs)
-                top_keys = list(plain.keys()) if isinstance(plain, dict) else [type(plain).__name__]
-                st.caption("Top-level keys of in-memory result:")
-                st.json(top_keys)
-            return
-
-        st.session_state["elastic_C_cached"] = C
-        st.session_state["elastic_where"] = where
-
-        steps.tick("Rendering results")
-        _render_elastic(C, where, show_where)
-
-        steps.finish(True)
-        st.success("Elastic constants computed ✅")
+        # Persist + render (list style)
+        st.session_state["elastic_payload"] = {"C_GPa": C_gpa.tolist(), "props": P}
+        _render_list_style(C_gpa, P)
 
     except Exception as e:
-        steps.finish(False)
         st.error(f"Elastic workflow failed: {e}")
-        with st.expander("Details"):
+        with st.expander("Exception", expanded=True):
             st.exception(e)
-
-__all__ = ["elastic_tab"]
+    finally:
+        st.session_state["elastic_running"] = False
