@@ -13,7 +13,7 @@ from atomate2.forcefields.flows.elastic import ElasticMaker
 from atomate2.forcefields.jobs import MACERelaxMaker
 
 
-# -------------------- tiny helpers --------------------
+# -------------------- helpers --------------------
 def _to_plain(obj):
     try:
         return jsanitize(obj, strict=False)
@@ -39,10 +39,10 @@ def _looks_like_6x6(mat):
 
 
 def _as_gpa_array(x):
-    """Heuristically convert Pa→GPa if needed, return ndarray in GPa."""
+    """Convert Pa→GPa if needed, return ndarray in GPa."""
     arr = np.array(x, dtype=float)
     try:
-        if np.nanmax(np.abs(arr)) > 1e5:  # looks like Pascals
+        if np.nanmax(np.abs(arr)) > 1e5:  # likely Pascals
             arr *= 1e-9
     except Exception:
         pass
@@ -50,7 +50,7 @@ def _as_gpa_array(x):
 
 
 def _props_to_gpa(props: dict) -> dict:
-    """Convert known scalar props Pa→GPa when needed."""
+    """Scalar props Pa→GPa when needed."""
     if not isinstance(props, dict):
         return {}
     out = {}
@@ -81,7 +81,7 @@ def _find_tensor_anywhere(d):
         if _looks_like_6x6(x):
             return x
         if isinstance(x, dict):
-            # prefer likely keys first
+            # try likely keys first
             for k in ("elastic_tensor", "tensor", "C_ij", "C", "voigt", "ieee_format",
                       "output", "data", "results", "result", "metadata"):
                 if k in x:
@@ -101,15 +101,47 @@ def _find_tensor_anywhere(d):
     return walk(d)
 
 
-def _render_results_json(C_gpa: np.ndarray, P: dict):
-    """Display clean JSON and a JSON download only (no tables/metrics)."""
+def _format_list_of_lists(arr):
+    """Pretty print a 6×6 list-of-lists as Python-style text."""
+    A = np.array(arr, dtype=float)
+    lines = ["["]
+    for i, row in enumerate(A):
+        row_txt = ", ".join(f"{v:.6f}" for v in row)
+        if i < len(A) - 1:
+            lines.append(f"  [{row_txt}],")
+        else:
+            lines.append(f"  [{row_txt}]")
+    lines.append("]")
+    return "\n".join(lines)
+
+
+def _render_list_style(C_gpa: np.ndarray, P: dict):
+    """Show C_ij and properties as list-style text (no tables/heatmaps)."""
+    st.markdown("### Elastic results (list style)")
+    st.markdown("**C_ij (GPa), 6×6 (Voigt/IEEE)**")
+    st.code(_format_list_of_lists(C_gpa), language="python")
+
+    # Bullet list of key properties
+    k = P.get("k_vrh"); g = P.get("g_vrh"); e = P.get("y_mod")
+    nu = P.get("homogeneous_poisson")
+    au = P.get("universal_anisotropy")
+
+    bullets = []
+    bullets.append(f"- K_VRH (GPa): {k:.3f}" if isinstance(k, (int, float)) else "- K_VRH (GPa): —")
+    bullets.append(f"- G_VRH (GPa): {g:.3f}" if isinstance(g, (int, float)) else "- G_VRH (GPa): —")
+    bullets.append(f"- E (GPa): {e:.3f}" if isinstance(e, (int, float)) else "- E (GPa): —")
+    bullets.append(f"- Poisson ν: {nu:.3f}" if isinstance(nu, (int, float)) else "- Poisson ν: —")
+    bullets.append(f"- Anisotropy AU: {au:.3f}" if isinstance(au, (int, float)) else "- Anisotropy AU: —")
+
+    st.markdown("\n".join(bullets))
+
+    # Also provide a JSON download for scripting if needed
     payload = {
-        "elastic_tensor_GPa": np.array(C_gpa, dtype=float).tolist(),  # 6x6
+        "elastic_tensor_GPa": np.array(C_gpa, dtype=float).tolist(),
         "derived_properties_GPa": {
-            k: (float(v) if isinstance(v, (int, float)) else v) for k, v in P.items()
+            k2: (float(v2) if isinstance(v2, (int, float)) else v2) for k2, v2 in P.items()
         },
     }
-    st.json(payload)
     st.download_button(
         "⬇️ Download results (JSON)",
         json.dumps(payload, indent=2).encode("utf-8"),
@@ -118,18 +150,15 @@ def _render_results_json(C_gpa: np.ndarray, P: dict):
     )
 
 
-# -------------------- Streamlit tab --------------------
+# -------------------- main Streamlit tab --------------------
 def elastic_tab(pmg_obj: Structure | None):
-    st.subheader("🧱 Elastic — MACE (JSON output only)")
+    st.subheader("🧱 Elastic — MACE (list output)")
     if pmg_obj is None:
         st.info("Upload/select a structure in the Viewer first.")
         return
 
     st.session_state.setdefault("elastic_running", False)
     st.session_state.setdefault("elastic_payload", None)
-
-    # Optional: flip on only when you want internal details
-    show_debug = st.toggle("Show debug details", value=False)
 
     disabled = st.session_state["elastic_running"]
     c1, c2 = st.columns(2)
@@ -149,11 +178,11 @@ def elastic_tab(pmg_obj: Structure | None):
 
     run_btn = st.button("Run Elastic Workflow", type="primary", disabled=disabled)
 
-    # Show last results (JSON-only)
+    # Show any cached results in list style
     if (not st.session_state["elastic_running"]) and st.session_state["elastic_payload"]:
         C_gpa = np.array(st.session_state["elastic_payload"]["C_GPa"], dtype=float)
         P     = st.session_state["elastic_payload"]["props"]
-        _render_results_json(C_gpa, P)
+        _render_list_style(C_gpa, P)
 
     if (not run_btn) or st.session_state["elastic_running"]:
         return
@@ -161,42 +190,16 @@ def elastic_tab(pmg_obj: Structure | None):
     # ===== Run once =====
     st.session_state["elastic_running"] = True
     try:
-        if show_debug:
-            st.info("Building MACE elastic flow…")
-
+        # Build flow (MACE on both relaxes)
         bulk_relax = MACERelaxMaker(relax_cell=True,  relax_kwargs={"fmax": float(fmax)})
         el_relax   = MACERelaxMaker(relax_cell=bool(allow_cell), relax_kwargs={"fmax": float(fmax)})
         maker = ElasticMaker(bulk_relax_maker=bulk_relax, elastic_relax_maker=el_relax)
         flow = maker.make(structure=pmg_obj)
 
-        if show_debug:
-            st.info("Running locally…")
-
-        # Follow the working pattern: do NOT pass store=; use SETTINGS.JOB_STORE afterwards
+        # Follow the reliable pattern: no explicit store arg; use SETTINGS.JOB_STORE afterwards
         rs = run_locally(flow, create_folders=True, ensure_success=False)
 
-        # Show failing jobs only when debug is on
-        if show_debug:
-            items = list(rs.items()) if isinstance(rs, dict) else list(enumerate(rs))
-            rows = []
-            for j, r in items:
-                nm = getattr(r, "name", None) or str(j)
-                rows.append({"job": str(j)[:8], "name": nm[:80], "error": bool(getattr(r, "error", None))})
-            st.dataframe(rows, use_container_width=True)
-            failed = [(j, r) for j, r in items if getattr(r, "error", None)]
-            if failed:
-                st.error(f"{len(failed)} job(s) failed.")
-                for j, r in failed[:5]:
-                    with st.expander(f"❌ {getattr(r,'name',str(j))} — job {str(j)}"):
-                        if getattr(r, "error", None):
-                            st.exception(getattr(r, "error"))
-                        st.caption("Output (sanitized)")
-                        st.json(_to_plain(getattr(r, "output", None)))
-                        st.caption("Metadata (sanitized)")
-                        st.json(_to_plain(getattr(r, "metadata", None)))
-                st.stop()
-
-        # Extract results from the store like in your working script
+        # Extract via Jobflow store (fit_elastic_tensor)
         store = SETTINGS.JOB_STORE
         if store is None:
             raise RuntimeError("SETTINGS.JOB_STORE is None after run_locally; cannot query results.")
@@ -213,11 +216,11 @@ def elastic_tab(pmg_obj: Structure | None):
         )
 
         if doc is None:
-            # Fallback: deep-scan responses to find 6×6
+            # fallback: deep-scan responses
             plain = _to_plain(rs)
             C_raw = _find_tensor_anywhere(plain)
             if C_raw is None:
-                raise RuntimeError("No 'fit_elastic_tensor' document found and no 6×6 tensor in responses.")
+                raise RuntimeError("No 'fit_elastic_tensor' document and no 6×6 tensor in responses.")
             P = {}
         else:
             out = doc.get("output", {}) if isinstance(doc, dict) else {}
@@ -227,26 +230,26 @@ def elastic_tab(pmg_obj: Structure | None):
                 raise RuntimeError("Elastic tensor found, but no 6×6 field among ieee_format/voigt/matrix/C_ij/C.")
             P = out.get("derived_properties", {}) or {}
 
-        # ---- Normalize units and compute E, ν in GPa ----
-        C_gpa = _as_gpa_array(C_raw)   # tensor → GPa
-        P     = _props_to_gpa(P)       # props → GPa if needed
+        # ---- Normalize units & recompute E, ν in GPa (override any stale Pa values) ----
+        C_gpa = _as_gpa_array(C_raw)        # tensor → GPa
+        P     = _props_to_gpa(P)            # properties → GPa if needed
 
         K = P.get("k_vrh")
         G = P.get("g_vrh")
         if isinstance(K, (int, float)) and isinstance(G, (int, float)):
             denom = 3.0 * K + G
             if denom != 0.0:
-                P["y_mod"] = 9.0 * K * G / denom               # E (GPa)
+                P["y_mod"] = 9.0 * K * G / denom                # E in GPa
                 P["homogeneous_poisson"] = (3.0 * K - 2.0 * G) / (2.0 * denom)
         else:
-            # if y_mod was in Pa, convert to GPa
+            # if only y_mod present and suspiciously large, convert to GPa
             y = P.get("y_mod")
             if isinstance(y, (int, float)) and abs(y) > 1e5:
                 P["y_mod"] = y * 1e-9
 
-        # Persist + show JSON-only
+        # Persist + render (list style)
         st.session_state["elastic_payload"] = {"C_GPa": C_gpa.tolist(), "props": P}
-        _render_results_json(C_gpa, P)
+        _render_list_style(C_gpa, P)
 
     except Exception as e:
         st.error(f"Elastic workflow failed: {e}")
