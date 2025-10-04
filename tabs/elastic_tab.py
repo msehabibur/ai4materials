@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Optional, Tuple, List
+from typing import Any, Optional, Tuple, List, Union
 
 import numpy as np
 import pandas as pd
@@ -50,6 +50,60 @@ def _is_6x6_numeric(x) -> bool:
     except Exception:
         return False
 
+def _maybe_convert_to_gpa(C: np.ndarray) -> Tuple[np.ndarray, str]:
+    C = np.array(C, dtype=float).reshape(6, 6)
+    # Typical GPa magnitudes are ~10–300; if much smaller, assume eV/Å^3
+    if np.max(np.abs(C)) < 20.0:
+        return C * EV_PER_ANG3_TO_GPA, "eV/Å³→GPa"
+    return C, "GPa"
+
+def _cij_dict_to_matrix(d: dict) -> Optional[np.ndarray]:
+    """
+    Accepts dicts like {'C11':..., 'C12':..., ..., 'C66':...} (case-insensitive),
+    fills symmetric 6x6 Voigt tensor.
+    """
+    if not isinstance(d, dict):
+        return None
+    D = {k.lower(): v for k, v in d.items()}
+    needed = [f"c{i}{j}" for i in range(1,7) for j in range(1,7) if i<=j]  # upper triangle keys
+    if not any(k in D for k in needed):
+        return None
+    C = np.zeros((6,6), float)
+    for i in range(1,7):
+        for j in range(i,7):
+            key = f"c{i}{j}"
+            if key in D:
+                C[i-1, j-1] = float(D[key])
+                C[j-1, i-1] = float(D[key])
+    # sanity: nonzero diagonal?
+    if not np.any(np.diag(C)):
+        return None
+    return C
+
+def _triplet_list_to_matrix(lst: List[dict]) -> Optional[np.ndarray]:
+    """
+    Accepts list like [{'i':1,'j':2,'value':..}, ...] or [i,j,val] triplets.
+    """
+    try:
+        C = np.zeros((6,6), float)
+        filled = False
+        for item in lst:
+            if isinstance(item, dict):
+                i, j, v = int(item["i"]), int(item["j"]), float(item["value"])
+            elif isinstance(item, (list, tuple)) and len(item) >= 3:
+                i, j, v = int(item[0]), int(item[1]), float(item[2])
+            else:
+                continue
+            if 1 <= i <= 6 and 1 <= j <= 6:
+                C[i-1, j-1] = v
+                C[j-1, i-1] = v
+                filled = True
+        if filled:
+            return C
+    except Exception:
+        pass
+    return None
+
 def _walk_paths(tree: Any, path: str = "$"):
     if isinstance(tree, dict):
         for k, v in tree.items():
@@ -60,28 +114,116 @@ def _walk_paths(tree: Any, path: str = "$"):
     else:
         yield (path, tree)
 
-def _maybe_convert_to_gpa(C: np.ndarray) -> Tuple[np.ndarray, str]:
-    C = np.array(C, dtype=float).reshape(6, 6)
-    # Typical GPa magnitudes ~10–300; if much smaller, assume eV/Å^3
-    if np.max(np.abs(C)) < 20.0:
-        return C * EV_PER_ANG3_TO_GPA, "eV/Å³→GPa"
-    return C, "GPa"
-
-def _extract_tensor_from_output_dict(out: dict) -> Optional[np.ndarray]:
+def _extract_tensor_from_output_dict(out: dict) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    """
+    Try multiple common locations/representations inside a job 'output' dict.
+    Returns (C, path).
+    """
+    # 1) Direct voigt array
     props = out.get("physical_properties") or {}
-    candidates: List[Any] = [
-        props.get("elastic_tensor_voigt"),
-        props.get("C_ij"),
-        out.get("elastic_tensor_voigt"),
-        out.get("C_ij"),
-        out.get("elastic_tensor"),
+    candidates: List[Tuple[str, Any]] = [
+        ("output.physical_properties.elastic_tensor_voigt", props.get("elastic_tensor_voigt")),
+        ("output.elastic_tensor_voigt", out.get("elastic_tensor_voigt")),
     ]
-    for C in candidates:
-        if C is not None and _is_6x6_numeric(C):
-            return np.array(C, dtype=float).reshape(6, 6)
-    return None
+    # 2) nested 'elastic_tensor': {'voigt': [[...]]}
+    et_props = props.get("elastic_tensor") if isinstance(props, dict) else None
+    et_out = out.get("elastic_tensor") if isinstance(out, dict) else None
+    candidates += [
+        ("output.physical_properties.elastic_tensor.voigt", isinstance(et_props, dict) and et_props.get("voigt")),
+        ("output.elastic_tensor.voigt", isinstance(et_out, dict) and et_out.get("voigt")),
+    ]
+    # 3) C_ij synonyms
+    candidates += [
+        ("output.physical_properties.C_ij", props.get("C_ij")),
+        ("output.C_ij", out.get("C_ij")),
+    ]
+    # 4) dict of C11..C66
+    for label, obj in list(candidates):
+        if isinstance(obj, dict):
+            m = _cij_dict_to_matrix(obj)
+            if m is not None:
+                return m, label
+    # 5) list of triplets
+    for label, obj in list(candidates):
+        if isinstance(obj, list):
+            m = _triplet_list_to_matrix(obj)
+            if m is not None:
+                return m, label
+    # 6) plain 6x6 anywhere among candidates
+    for label, obj in candidates:
+        if _is_6x6_numeric(obj):
+            return np.array(obj, float).reshape(6, 6), label
+    return None, None
+
+def _deep_find_elastic(tree: Any) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    """
+    Deep scan a nested dict/list for any recognizable elastic tensor form.
+    Order:
+      - known containers/keys
+      - 6x6 numeric array anywhere
+      - dict C11..C66
+      - list of triplets
+    """
+    # First: check some likely containers quickly
+    if isinstance(tree, dict):
+        for key in ("output", "result", "results", "data", "physical_properties"):
+            node = tree.get(key)
+            if isinstance(node, dict):
+                C, where = _extract_tensor_from_output_dict(node if key == "output" else {"physical_properties": node})
+                if C is not None:
+                    return C, f"rs.{key}.{where.split('.',1)[-1]}"
+                # direct keys inside container
+                for k in ("elastic_tensor_voigt", "C_ij", "elastic_tensor"):
+                    v = node.get(k)
+                    if v is not None:
+                        if _is_6x6_numeric(v):
+                            return np.array(v, float).reshape(6, 6), f"rs.{key}.{k}"
+                        if isinstance(v, dict):
+                            m = _cij_dict_to_matrix(v) or _extract_tensor_from_output_dict({"elastic_tensor": v})[0]
+                            if m is not None:
+                                return m, f"rs.{key}.{k}"
+                        if isinstance(v, list):
+                            m = _triplet_list_to_matrix(v)
+                            if m is not None:
+                                return m, f"rs.{key}.{k}"
+
+    # Full deep walk: prefer paths that mention 'elastic'
+    array_hits: List[Tuple[str, np.ndarray]] = []
+    dict_hits: List[Tuple[str, np.ndarray]] = []
+    triplet_hits: List[Tuple[str, np.ndarray]] = []
+    for p, v in _walk_paths(tree):
+        if _is_6x6_numeric(v):
+            array_hits.append((p, np.array(v, float).reshape(6, 6)))
+        elif isinstance(v, dict):
+            m = _cij_dict_to_matrix(v)
+            if m is not None:
+                dict_hits.append((p, m))
+            else:
+                # nested 'voigt'
+                if "voigt" in v and _is_6x6_numeric(v.get("voigt")):
+                    dict_hits.append((p+".voigt", np.array(v["voigt"], float).reshape(6,6)))
+        elif isinstance(v, list):
+            m = _triplet_list_to_matrix(v)
+            if m is not None:
+                triplet_hits.append((p, m))
+
+    def _best(hits: List[Tuple[str, np.ndarray]]) -> Optional[Tuple[str, np.ndarray]]:
+        if not hits:
+            return None
+        hits.sort(key=lambda t: ("elastic" not in t[0].lower(), len(t[0])))
+        return hits[0]
+
+    for bag in (dict_hits, triplet_hits, array_hits):
+        best = _best(bag)
+        if best:
+            return best[1], best[0]
+    return None, None
 
 def _query_elastic_from_store() -> Tuple[Optional[np.ndarray], Optional[str], Optional[dict]]:
+    """
+    Pull latest doc from JobStore and deep-scan it entirely (not just output),
+    since schemas differ across versions.
+    """
     store = SETTINGS.JOB_STORE
     if store is None:
         return None, None, None
@@ -94,58 +236,16 @@ def _query_elastic_from_store() -> Tuple[Optional[np.ndarray], Optional[str], Op
     last_doc = None
     for name in names:
         try:
-            doc = store.query_one(
-                {"name": name},
-                properties=["output", "completed_at", "name", "uuid"],
-                sort={"completed_at": -1},
-                load=True,
-            )
+            # load the full doc to allow deep scan
+            doc = store.query_one({"name": name}, properties=["*"], sort={"completed_at": -1}, load=True)
         except Exception:
             doc = None
         if isinstance(doc, dict):
             last_doc = doc
-            out = doc.get("output") or {}
-            # try the common locations
-            for key in (
-                "physical_properties.elastic_tensor_voigt",
-                "physical_properties.C_ij",
-                "elastic_tensor_voigt",
-                "C_ij",
-                "elastic_tensor",
-            ):
-                node = out
-                ok = True
-                for p in key.split("."):
-                    if isinstance(node, dict) and p in node:
-                        node = node[p]
-                    else:
-                        ok = False
-                        break
-                if ok and _is_6x6_numeric(node):
-                    return np.array(node, float).reshape(6, 6), f"JobStore:{name}.output.{key}", doc
+            C, where = _deep_find_elastic(doc)
+            if C is not None:
+                return C, f"JobStore:{name}:{where or 'full_doc'}", doc
     return None, None, last_doc
-
-def _deep_find_elastic(tree: Any) -> Tuple[Optional[np.ndarray], Optional[str]]:
-    # Quick checks
-    if isinstance(tree, dict):
-        for key in ("output", "result", "results", "data", "physical_properties"):
-            node = tree.get(key)
-            if isinstance(node, dict):
-                for k in ("elastic_tensor_voigt", "C_ij", "elastic_tensor"):
-                    v = node.get(k)
-                    if _is_6x6_numeric(v):
-                        return np.array(v, float).reshape(6, 6), f"rs.{key}.{k}"
-
-    # Deep search
-    hits: List[Tuple[str, np.ndarray]] = []
-    for p, v in _walk_paths(tree):
-        if _is_6x6_numeric(v):
-            hits.append((p, np.array(v, float).reshape(6, 6)))
-    if not hits:
-        return None, None
-    # Prefer paths that mention 'elastic'
-    hits.sort(key=lambda t: ("elastic" not in t[0], len(t[0])))
-    return hits[0][1], hits[0][0]
 
 def _render_elastic(C_raw: np.ndarray, where: Optional[str], show_where: bool):
     C_gpa, conv = _maybe_convert_to_gpa(C_raw)
@@ -171,8 +271,8 @@ def _render_elastic(C_raw: np.ndarray, where: Optional[str], show_where: bool):
 
     payload = {
         "units": "GPa",
-        "unit_conversion": conv,
         "C_voigt": C_gpa.tolist(),
+        "unit_conversion": conv,
         "K_VRH": float(et.k_vrh),
         "G_VRH": float(et.g_vrh),
         "E_VRH": float(et.y_modulus),
@@ -223,7 +323,7 @@ def elastic_tab(pmg_obj: Structure | None):
     st.divider()
     st.caption("Or run with default settings (same as before):")
 
-    # ----- Default-run path (no unsupported kwargs) -----
+    # ----- Default-run path (KEEP LIKE BEFORE) -----
     run_btn = st.button("Run Elastic Workflow (default)", type="primary")
     if not run_btn:
         return
@@ -232,13 +332,12 @@ def elastic_tab(pmg_obj: Structure | None):
     try:
         steps.tick("Building workflow")
         try:
-            # IMPORTANT: no unsupported kwargs here
-            from atomate2.forcefields.flows.elastic import ElasticMaker
+            from atomate2.forcefields.flows.elastic import ElasticMaker  # no kwargs
         except Exception:
             st.error("ElasticMaker not found (atomate2.forcefields.flows.elastic). Please update atomate2.")
             return
 
-        maker = ElasticMaker()              # <-- KEEP LIKE BEFORE (no max_strain / n_steps)
+        maker = ElasticMaker()  # KEEP LIKE BEFORE (no unsupported kwargs)
         flow = maker.make(structure=pmg_obj)
 
         steps.tick("Executing locally")
@@ -253,7 +352,13 @@ def elastic_tab(pmg_obj: Structure | None):
 
         if C is None:
             steps.finish(False)
-            st.error("Elastic tensor not found (no 'elastic_tensor_voigt' / 'C_ij' in outputs).")
+            st.error("Elastic tensor not found in outputs. Turn on Debug to inspect paths.")
+            # Minimal peek to help diagnose (without spamming)
+            if show_where:
+                plain = _to_plain(rs)
+                top_keys = list(plain.keys()) if isinstance(plain, dict) else [type(plain).__name__]
+                st.caption("Top-level keys of in-memory result:")
+                st.json(top_keys)
             return
 
         st.session_state["elastic_C_cached"] = C
